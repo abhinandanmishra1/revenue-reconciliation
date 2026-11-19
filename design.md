@@ -190,6 +190,18 @@ Pending and failed events move no money and do not count towards `collected`. A 
 - **Order in status `refunded`.** Expects a full refund (net 0). A smaller settled refund is `REFUND_INCOMPLETE`: the customer may still be owed the balance, or the order status is wrong.
 - **Refund without a matching original charge.** Defined per key, as settled refunds exceeding settled charges (net collected < 0), since refunds are not linked to individual charges.
   - On an order, of any status, this is `OVER_REFUNDED`. Money left the business beyond what was taken for that order.
+  - **Two different amounts for `OVER_REFUNDED`, kept separate on purpose:**
+    - **`amount_at_risk` = −difference** is the *total revenue shortfall* against what the order system expects. This is what the dashboard's money-at-risk KPI sums. It is the same definition every other order category uses (the gap between expected and collected), and it keeps risk monotonic: on a completed order, a larger refund can never show *less* risk than a smaller one.
+    - **`excess_refund` = Σ settled refunds − Σ settled charges** is the cash paid out *beyond anything collected* for that key. It is stored in the item's evidence and shown in the drill-down drawer and reason text. It is **not** added to any KPI, so nothing is counted twice.
+  - Worked example, completed order, expected 100:
+
+    | Charge | Refund | Collected | Category | `amount_at_risk` (KPI) | `excess_refund` (drawer) |
+    |---|---|---|---|---|---|
+    | 100 | 20 | 80 | `REFUND_NOT_IN_ORDERS` | 20 | 0 |
+    | 100 | 100 | 0 | `REFUND_NOT_IN_ORDERS` | 100 | 0 |
+    | 100 | 120 | −20 | `OVER_REFUNDED` | 120 (100 the order system doesn't know was refunded + 20 paid out beyond the charge) | 20 |
+
+    For a refunded or cancelled order (expected 0), the two amounts are equal (e.g. charge 100, refund 120 → both 20).
   - On a key with no order, it is an `ORPHAN_PAYMENT` with direction under-collected (money paid out against no order).
   - A refund in a different currency from the order is caught by `CURRENCY_MISMATCH`.
 - **Pending and failed refunds** move no money. They are listed in the evidence and flagged (`pending_refund`) but do not change `collected`.
@@ -212,7 +224,7 @@ Pending and failed events move no money and do not count towards `collected`. A 
 | 4 | `PAYMENT_PENDING` | No settled charge and a pending charge exists | Low | Pending amount | Under-collected if expected > 0; over-collected if the order is cancelled/refunded (the charge should be voided) |
 | 5 | `CANCELLED_BUT_CHARGED` | Cancelled, `collected > tol` | High | collected | Over-collected |
 | 6 | `REFUND_INCOMPLETE` | Refunded, `collected > tol` | High | collected | Over-collected |
-| 7 | `OVER_REFUNDED` | `collected < −tol` (refunds exceed charges, i.e. a refund without a matching charge) | High | −difference (whole shortfall vs what the order system expects) | Under-collected |
+| 7 | `OVER_REFUNDED` | `collected < −tol` (refunds exceed charges, i.e. a refund without a matching charge) | High | −difference (total revenue shortfall vs what the order system expects); `excess_refund` is stored separately in the evidence (section 7.1) | Under-collected |
 | 8 | `REFUND_NOT_IN_ORDERS` | Completed, settled refund(s) exist, **and** `difference < −tol` | Medium | −difference | Under-collected (order system overstates revenue) |
 | 9 | `DUPLICATE_CHARGE` | ≥ 2 settled charges each within tol of expected, and `difference > tol` | High | difference | Over-collected |
 | 10 | `OVERCHARGED` | `difference > tol` | High | difference | Over-collected |
@@ -350,7 +362,16 @@ All non-2xx responses use the error shape from section 5a. Unauthenticated reque
   - completed with partial refund → refund not recorded
   - a rejected payment row with a readable order reference → that order becomes needs review (not missing payment)
   - a rejected row with a blank or unreadable key → validation report only; no item is affected
-  - refund-only order → over-refunded with the whole shortfall at risk
+  - refund boundary cases (order net = 100 in every row; all events settled, same currency; expected = 100 for completed, 0 for refunded):
+
+    | Order status | Charge | Refund | Category | `amount_at_risk` | Direction | `excess_refund` |
+    |---|---|---|---|---|---|---|
+    | refunded | 100 | 80 | `REFUND_INCOMPLETE` | 20 | over-collected | 0 |
+    | refunded | 100 | 120 | `OVER_REFUNDED` | 20 | under-collected | 20 |
+    | completed | 100 | 20 | `REFUND_NOT_IN_ORDERS` | 20 | under-collected | 0 |
+    | completed | 100 | 100 | `REFUND_NOT_IN_ORDERS` | 100 | under-collected | 0 |
+    | completed | 100 | 120 | `OVER_REFUNDED` | 120 | under-collected | 20 |
+    | completed (refund only) | — | 30 | `OVER_REFUNDED` | 130 | under-collected | 30 |
   - refund-only orphan → orphan, under-collected
   - every accepted order and payment belongs to exactly one item
   - currency mismatch never summed across currencies
