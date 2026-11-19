@@ -1,3 +1,4 @@
+import logging
 import re
 
 from fastapi import APIRouter, Depends, Request, Response
@@ -17,6 +18,7 @@ from app.security.passwords import MAX_PASSWORD_BYTES, MIN_PASSWORD_BYTES, hash_
 from app.security.ratelimit import limits
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
+log = logging.getLogger("app.auth")
 
 _EMAIL = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
@@ -77,6 +79,9 @@ def _rate_limited(retry_after: int) -> ApiError:
 
 
 def _check_ip(request: Request, settings: Settings) -> str:
+    # Hop count only (no addresses): used once to verify TRUSTED_PROXY_HOPS on the live chain.
+    forwarded = request.headers.get("x-forwarded-for", "")
+    log.info("auth request forwarded_for_entries=%d", len([e for e in forwarded.split(",") if e.strip()]))
     ip = client_ip(request, settings.trusted_proxy_hops)
     retry = limits.auth_ip.take(ip)
     if retry is not None:
