@@ -4,7 +4,7 @@ A multi-tenant application for importing order and payment data, reconciling fin
 
 The product is designed around a simple principle: **reconciliation decisions must be deterministic, explainable, reproducible, and isolated per customer**. AI may help explain a result, but it never decides whether two financial records match.
 
-> Project status: product requirements and architecture proposal. Implementation has not started. Decisions marked **Proposed** are open for review before they become implementation contracts.
+> Project status: design agreed (see `design.md`), implementation in progress.
 
 ## Problem
 
@@ -52,25 +52,25 @@ This application provides a repeatable workflow to:
 6. **Explainable AI:** AI can summarize evidence already computed by the system; it cannot invent evidence or decide financial outcomes.
 7. **Incremental delivery:** begin with a modular monolith and evolve only when real constraints require it.
 
-## Proposed technology
+## Technology
 
-| Layer | Proposed choice |
+| Layer | Choice |
 |---|---|
 | Web application | Next.js, React, TypeScript |
 | UI | Tailwind CSS and shadcn/ui |
-| Charts | Recharts |
-| Authentication | Clerk |
+| Charts / tables | Recharts, TanStack Table |
+| Authentication | Own: bcrypt password hashing, JWT in an httpOnly cookie |
 | API | Python and FastAPI |
 | Database | PostgreSQL |
 | ORM and migrations | SQLAlchemy 2.x and Alembic |
 | Validation | Pydantic |
-| AI explanations | Gemini API, optional |
+| AI explanations | Gemini API (backend only, structured output, deterministic fallback) |
 | Frontend hosting | Vercel |
 | API hosting | Railway |
 | Database hosting | Neon |
-| Testing | Pytest and Vitest |
+| Testing | Pytest |
 
-These are proposals, not implementation constraints. The design document records the rationale and the decisions that need review.
+The design document records the rationale for each choice and what was deliberately left out.
 
 ## High-level workflow
 
