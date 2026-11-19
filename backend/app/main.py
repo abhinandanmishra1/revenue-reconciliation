@@ -4,7 +4,7 @@ from fastapi import FastAPI
 
 from app import errors
 from app.config import get_settings
-from app.routers import auth, imports
+from app.routers import auth, explain, imports
 from app.security.origin import OriginCheckMiddleware
 
 logging.basicConfig(level=logging.INFO)
@@ -17,6 +17,7 @@ def create_app() -> FastAPI:
     app.add_middleware(OriginCheckMiddleware, allowed=settings.app_origins)
     app.include_router(auth.router)
     app.include_router(imports.router)
+    app.include_router(explain.router)
 
     @app.get("/api/health")
     def health() -> dict[str, str]:

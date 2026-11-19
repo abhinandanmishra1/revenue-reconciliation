@@ -5,9 +5,11 @@ from fastapi import APIRouter, Depends, File, Query, Response, UploadFile
 from sqlalchemy import and_, exists, func, or_, select
 from sqlalchemy.orm import Session
 
+from app.config import Settings, get_settings
 from app.db.models import Import, Order, Payment, ReconciliationItem, User
 from app.db.session import get_db
 from app.deps import current_user, owned_import
+from app.explain import cache
 from app.errors import ApiError, not_found
 from app.ingestion.models import MAX_FILE_BYTES, FileRejected
 from app.reconcile.rules import CATEGORIES, DIRECTIONS, SEVERITY_RANK
@@ -87,8 +89,15 @@ def history(user: User = Depends(current_user), db: Session = Depends(get_db)):
 
 
 @router.get("/{import_id}")
-def detail(import_id: uuid.UUID, user: User = Depends(current_user), db: Session = Depends(get_db)):
-    return {"import": _import_out(owned_import(db, import_id, user), full=True)}
+def detail(
+    import_id: uuid.UUID,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+    settings: Settings = Depends(get_settings),
+):
+    imp = owned_import(db, import_id, user)
+    summary = cache.get_cached(db, imp.id, None, settings.gemini_model or "none")
+    return {"import": _import_out(imp, full=True), "summary_explanation": cache.explanation_out(summary)}
 
 
 def item_out(item: Item, *, evidence: bool = False) -> dict:
@@ -182,10 +191,15 @@ def _check_values(name: str, values: list[str] | None, allowed) -> None:
 
 @router.get("/{import_id}/items/{item_id}")
 def item_detail(
-    import_id: uuid.UUID, item_id: uuid.UUID, user: User = Depends(current_user), db: Session = Depends(get_db)
+    import_id: uuid.UUID,
+    item_id: uuid.UUID,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+    settings: Settings = Depends(get_settings),
 ):
     imp = owned_import(db, import_id, user)
     item = db.scalar(select(Item).where(Item.id == item_id, Item.import_id == imp.id))
     if item is None:
         raise not_found("Item")
-    return {"item": item_out(item, evidence=True), "explanation": None}
+    cached = cache.get_cached(db, imp.id, item.id, settings.gemini_model or "none")
+    return {"item": item_out(item, evidence=True), "explanation": cache.explanation_out(cached)}
