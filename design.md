@@ -64,11 +64,22 @@ Browser ──► Next.js (Vercel)
   - If both are absent, the request gets `403`. Current browsers send `Origin` on POST requests, so only non-browser clients hit this case. Those clients don't carry a victim's cookie, so rejecting them costs nothing for the web app. API tests set the header explicitly.
   - Content-type checks are *not* relied on, because HTML forms can send multipart cross-site.
 - **Rate limiting (minimum before public deployment):** an in-process sliding-window limiter on the abuse-prone endpoints, returning `429` with `Retry-After`.
-  - Login: 5 failed attempts per normalised email per 15 min. This is a throttle, not a permanent lockout, so an attacker cannot lock a victim out of their account.
-  - Login + signup: 20 requests per client IP per minute.
-  - Explain endpoints: 10 requests per user per minute, to cap LLM cost.
+  - **Login, hard limit per client IP + normalised email:** 5 failed attempts per 15 min, then `429`. A successful login resets that pair's counter. An attacker who burns the attempts for a victim's email only blocks *their own* IP for that email; the victim, on a different IP, can still sign in.
+  - **Login + signup, hard limit per client IP:** 20 requests per minute, then `429`. This stops one source from spraying many emails or creating accounts in bulk.
+  - **Login, per normalised email across all IPs:** **no hard block.** A hard per-email limit would let any unauthenticated third party lock a known user out (a targeted denial of service), so this layer only **slows** attempts:
+    - after 10 failed attempts for that email within 15 min, every further login attempt for that email waits an extra 1 s, doubling up to a 5 s cap, until the window clears;
+    - the delay is applied *before* the password check and to every attempt for that email, including correct ones, so its presence reveals nothing about whether a password was right;
+    - a legitimate user under attack gets in a few seconds slower, never refused. Combined with bcrypt's cost, this keeps distributed guessing slow.
+  - **No account-existence leak:** counters and delays are keyed on the normalised email string whether or not an account exists. Unknown and known emails get identical status codes, error bodies and throttling behaviour. The generic `401 invalid credentials` is unchanged.
+  - **Explain endpoints, per user:** 10 requests per minute, to cap LLM cost (these require a session, so they can't be triggered against someone else).
 
-  The per-email and per-user limits don't depend on IP addresses, so they are the reliable layer. The per-IP limit uses the client address forwarded by the proxy chain and is best-effort, because forwarded headers can be influenced by clients. Limits are held in memory: correct for the single API instance in v1, but they reset on restart and are not shared across instances. A shared store (Redis) is the path when scaling out (section 10).
+  **Client IP source:** behind the Vercel → Railway proxy chain, the socket peer is a proxy, not the user. The client IP is therefore read from `X-Forwarded-For`, counting `TRUSTED_PROXY_HOPS` entries from the right (the entries appended by our own proxies). Entries further left can be forged by the client and are ignored. This has to be verified on the deployed environment before launch. If it is misconfigured, either every user shares one IP bucket, or clients can rotate their apparent IP.
+
+  **Known limits:**
+  - IP-based limits are weaker against attackers spread across many IPs; the per-email delay is the backstop for that.
+  - Users behind one shared NAT share the per-IP budget, but the per-IP + email key means they don't block each other's accounts.
+  - Limits are held in memory: correct for the single API instance in v1, but they reset on restart and are not shared across instances.
+  - CAPTCHA or other step-up verification for suspicious attempts, and a shared store (Redis), are the path when scaling out (section 10).
 - **Frontend guard:** Next.js middleware redirects to `/login` when the cookie is absent. This is UX only; the API is the enforcement point.
 - **Tests** prove that user B cannot list, read, or explain user A's imports or results.
 
@@ -306,7 +317,7 @@ Normalised references, blank optional fields, collapsed duplicate rows, fee/cons
 | Object storage for files | Files are KB-sized and stored in Postgres with a hash, in the same transaction | S3 with private keys + signed URLs |
 | Background queue | Synchronous processing finishes in milliseconds | Worker + job table; the job carries ids and re-checks ownership |
 | Refresh tokens, revocation, password reset | Out of scope for 24 h | Rotating refresh token + server-side session table, email reset flow |
-| Shared rate limiting | v1 ships an in-memory limiter (section 4), which is correct for one API instance | Move the counters to Redis when running more than one instance |
+| Shared rate limiting, step-up verification | v1 ships an in-memory limiter with IP hard limits and per-email progressive delay (section 4), which is correct for one API instance | Move the counters to Redis when running more than one instance; add CAPTCHA or another step-up check after repeated failures for an email |
 | Postgres row-level security | One enforced query path + tests | RLS as defence in depth |
 | FX conversion | No agreed rate source | Rates table with source and timestamp |
 
@@ -392,7 +403,12 @@ All non-2xx responses use the error shape from section 5a. Unauthenticated reque
   - POST with a foreign `Origin` → 403
   - POST with no `Origin` but a matching `Referer` → allowed
   - POST with neither header → 403
-  - 6th failed login for one email within 15 min → 429 with `Retry-After`
+  - 6th failed login from one IP for one email within 15 min → 429 with `Retry-After`; a successful login resets that pair
+  - the same email from a *different* IP is not refused after another IP exhausted its attempts (the victim can still sign in)
+  - after 10 failures for an email across IPs → attempts are delayed (1 s, doubling to a 5 s cap) but never refused, including the correct password
+  - 21st login/signup request from one IP within a minute → 429
+  - unknown vs known email → identical status codes, bodies and throttling
+  - client IP is taken from the trusted `X-Forwarded-For` hop; a client-supplied leftmost entry does not change the bucket
   - explain beyond the per-user limit → 429
   - cross-user list/read/explain → 404
   - same file pair uploaded twice (sequentially and concurrently) → one import
@@ -411,6 +427,7 @@ All non-2xx responses use the error shape from section 5a. Unauthenticated reque
 | `JWT_SECRET` | API | ≥ 32 random bytes |
 | `COOKIE_SECURE` | API | `true` in production, `false` only for local HTTP |
 | `APP_ORIGINS` | API | Comma-separated exact origins allowed for `POST` requests (e.g. the production web URL; add `http://localhost:3000` locally) |
+| `TRUSTED_PROXY_HOPS` | API | Number of our own proxies in front of the API (Vercel + Railway); used to read the real client IP from `X-Forwarded-For`. `0` locally |
 | `GEMINI_API_KEY` | API | LLM key (backend only) |
 | `GEMINI_MODEL` | API | Model id |
 | `API_BASE_URL` | Web (server-side) | Target of the `/api/*` rewrite |
