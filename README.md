@@ -1,10 +1,8 @@
 # Revenue Reconciliation Dashboard
 
-A multi-tenant application for importing order and payment data, reconciling financial records, investigating discrepancies, and understanding settlement outcomes.
+A per-user workspace for importing order and payment data, reconciling financial records, investigating discrepancies, and understanding settlement outcomes. Each user's imports and results are private to that user; there are no shared or organisation workspaces.
 
-The product is designed around a simple principle: **reconciliation decisions must be deterministic, explainable, reproducible, and isolated per customer**. AI may help explain a result, but it never decides whether two financial records match.
-
-> Project status: design agreed (see `design.md`), implementation in progress.
+The product is designed around a simple principle: **reconciliation decisions must be deterministic, explainable, reproducible, and isolated per user**. AI may help explain a result, but it never decides whether two financial records match.
 
 ## Problem
 
@@ -24,33 +22,33 @@ This application provides a repeatable workflow to:
 
 ### In scope
 
-- Authenticated, tenant-scoped workspaces.
-- Uploading separate orders and payments CSV files.
-- File metadata, validation summaries, and import history.
-- Parsing and normalizing source records while preserving raw values.
-- Reconciliation runs that are reproducible and retain their inputs and rule version.
-- Deterministic matching and discrepancy classification.
-- Currency-aware dashboard summaries and searchable discrepancy details.
-- Evidence-backed AI explanations for reconciliation outcomes.
-- Audit-friendly status and processing history.
+- Email + password accounts; each user sees only their own data.
+- Uploading an orders CSV and a payments CSV together as one import.
+- Validation reports with row-level reasons, and import history.
+- Parsing and normalizing source records while preserving raw values and the original files.
+- Reproducible reconciliation: each import records its file hashes and rules version.
+- Deterministic matching and discrepancy classification with stored evidence.
+- Currency-aware dashboard summaries, a priority-ordered and searchable discrepancy table, and drill-down to source rows.
+- AI explanations of individual discrepancies and of a whole import, with a deterministic fallback.
 
 ### Out of scope for the initial version
 
 - Initiating payments, refunds, payouts, or bank transfers.
 - Automatically changing source-system records.
-- Cross-customer reporting or data visibility.
+- Organisations, shared workspaces, and roles.
+- FX conversion between currencies.
 - LLM-driven matching or mutation of financial records.
-- Complex accounting, tax, or general-ledger functionality unless explicitly required later.
+- Complex accounting, tax, or general-ledger functionality.
 
 ## Core principles
 
-1. **Tenant isolation:** every customer-owned record is scoped by a verified tenant identity.
+1. **Data isolation:** every import belongs to one user; all data is reached only through an import owned by the requesting user.
 2. **Traceability:** original uploads and raw field values remain available for audit and investigation.
-3. **Determinism:** the reconciliation engine uses explicit rules and produces the same result for the same inputs and rule version.
-4. **Currency safety:** amounts are never aggregated across currencies without an explicit conversion policy.
-5. **Reproducibility:** each reconciliation run references immutable upload inputs and a rule version.
+3. **Determinism:** the reconciliation engine uses explicit rules and produces the same result for the same inputs and rules version, regardless of row order.
+4. **Currency safety:** amounts are never aggregated across currencies.
+5. **Idempotency:** repeating a request (signup, upload, explain) never repeats its side effects; a failed request leaves no partial state.
 6. **Explainable AI:** AI can summarize evidence already computed by the system; it cannot invent evidence or decide financial outcomes.
-7. **Incremental delivery:** begin with a modular monolith and evolve only when real constraints require it.
+7. **Incremental delivery:** a modular monolith, extended only when real constraints require it.
 
 ## Technology
 
@@ -74,25 +72,14 @@ The design document records the rationale for each choice and what was deliberat
 
 ## High-level workflow
 
-1. A user signs in and receives an authenticated session.
-2. The API independently verifies the identity token and derives the tenant from trusted claims.
-3. The user uploads the order and payment source files.
-4. The API stores upload metadata and the original files in private storage.
-5. The ingestion pipeline validates, parses, and normalizes the rows into tenant-scoped relational records.
-6. The user starts a reconciliation run referencing selected uploads and a versioned rule set.
-7. The deterministic engine matches records and records exceptions with explicit evidence.
-8. Dashboard APIs aggregate the stored run results by currency and discrepancy type.
-9. An optional explanation endpoint may describe a selected result using its stored evidence.
+1. A user signs up or logs in and receives an httpOnly session cookie.
+2. The user uploads the orders file and the payments file together.
+3. The API validates and parses both files in memory, then reconciles them with the deterministic engine.
+4. In one transaction, it stores the import (original files, hashes, rules version), the parsed rows, every reconciliation result, and the summary. Uploading the same file pair again returns the existing import.
+5. The dashboard shows headline figures by currency, a breakdown by discrepancy type, and a priority-ordered table that drills down to source rows.
+6. On request, the API asks the LLM to explain a result or the whole import from the stored evidence, with a deterministic fallback if the LLM fails.
 
 ## Repository guide
 
-- `README.md` — product overview, scope, principles, proposed stack, and workflow.
-- `design.md` — architecture, data model, ingestion, reconciliation, security, API, testing, and open decisions.
-
-## Development status
-
-This repository currently contains planning documentation only. No application code or source datasets are included yet.
-
-## Working agreement
-
-Discuss requirements, edge cases, architecture, and data contracts before implementation. Treat proposed decisions as reviewable until they are explicitly agreed. Keep source datasets and assignment materials out of this repository unless separately and deliberately approved.
+- `README.md` — product overview, scope, principles, stack, and workflow.
+- `design.md` — goal, architecture, key decisions, data model, ingestion, reconciliation rules, metrics, security, LLM approach, API, UI, testing, and configuration.
