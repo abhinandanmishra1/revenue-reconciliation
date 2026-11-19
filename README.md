@@ -1,10 +1,8 @@
 # Revenue Reconciliation Dashboard
 
-A per-user workspace for importing order and payment data, reconciling financial records, investigating discrepancies, and understanding settlement outcomes. Each user's imports and results are private to that user; there are no shared or organisation workspaces in v1.
+A per-user workspace for importing order and payment data, reconciling financial records, investigating discrepancies, and understanding settlement outcomes. Each user's imports and results are private to that user; there are no shared or organisation workspaces.
 
 The product is designed around a simple principle: **reconciliation decisions must be deterministic, explainable, reproducible, and isolated per user**. AI may help explain a result, but it never decides whether two financial records match.
-
-> Project status: design agreed (see `design.md`), implementation in progress.
 
 ## Problem
 
@@ -84,12 +82,4 @@ The design document records the rationale for each choice and what was deliberat
 ## Repository guide
 
 - `README.md` — product overview, scope, principles, stack, and workflow.
-- `design.md` — architecture, data model, idempotency, ingestion contract, reconciliation rules, metrics, LLM approach, API, UI, testing, and configuration.
-
-## Development status
-
-Design agreed; implementation in progress.
-
-## Working agreement
-
-Discuss requirements, edge cases, architecture, and data contracts before implementation. The two sample CSVs will be added only as test fixtures under `backend/tests/fixtures/` when the engine tests are written; they are not in the repository yet.
+- `design.md` — goal, architecture, key decisions, data model, ingestion, reconciliation rules, metrics, security, LLM approach, API, UI, testing, and configuration.

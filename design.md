@@ -1,442 +1,399 @@
-# Design — Revenue Reconciliation Dashboard
+# Revenue Reconciliation — Design
 
-> Status: **agreed design** (v1.2). v1 is a per-user workspace (each user's data is private to them), replacing the earlier multi-tenant proposal. v1.1 fixed classification precedence, defined the ingestion contract and indexes, and corrected the LLM temperature decision. v1.2 defines:
-> - how rejected rows link to results
-> - refund semantics
-> - a currency-neutral tolerance
-> - per-category dispute formulas
-> - database constraints
-> - minimum auth hardening
->
-> Every cut is recorded in section 10 with the path to add it back.
+## 1. Goal
 
-## 1. Goals
+A store keeps orders in one system and payments in its payment processor. The two should agree, and often don't. This application lets a user upload both exports, reconciles them, and shows on one dashboard:
 
-- Let a signed-in user upload an orders export and a payment-processor export, reconcile them, and see where money is leaking.
-- Reconciliation is **deterministic and repeatable**: the same input files and rules version always produce the same classifications and amounts, regardless of row order. Generated ids and timestamps are not part of the result.
-- Every result carries **evidence** (source rows, compared values, rule applied) so a reviewer can reach the same conclusion without AI.
+- **how bad it is:** how much value reconciles, how much is in dispute, and how much money is at risk;
+- **what kind of problems exist:** discrepancies grouped by type;
+- **what to look at first:** a prioritised, searchable list that drills down to the source rows.
+
+Principles:
+- Reconciliation is **deterministic**: the same files and rules version always give the same result, regardless of row order.
+- Every result carries **evidence** (source rows, compared values, rule applied), so anyone can verify it without AI.
 - An LLM **explains** results in plain language. It never decides whether records match.
-- Money is handled with `Decimal` / `NUMERIC(14,2)`, never floats. Amounts in different currencies are never added together.
+- Money uses `Decimal` / `NUMERIC(14,2)`, never floats. Amounts in different currencies are never added together.
+- Each user's data is private to that user.
 
 ## 2. Architecture
 
 ```
 Browser ──► Next.js (Vercel)
-              │  /api/*  rewrite (same origin → httpOnly cookie, no CORS)
+              │  /api/*  rewrite (same origin)
               ▼
            FastAPI (Railway)
-              ├─ auth        : signup / login / logout / me (bcrypt + JWT cookie)
-              ├─ ingestion   : CSV validation, parsing, normalisation (pure)
-              ├─ reconcile   : deterministic engine (pure, no I/O)
-              ├─ dashboard   : summary + filterable result queries
-              └─ explain     : LLM adapter (Gemini) with schema validation + fallback
+              ├─ auth        signup / login / logout / me
+              ├─ ingestion   CSV validation, parsing, normalisation   (pure)
+              ├─ reconcile   deterministic engine                     (pure)
+              ├─ dashboard   summary + filterable result queries
+              └─ explain     Gemini adapter, schema validation, fallback
               ▼
            PostgreSQL (Neon)
 ```
 
-- **Modular monolith.** Ingestion parsing and the reconciliation engine are pure functions, `(file bytes) -> parsed rows + validation report` and `(orders, payments, rules) -> results`. They have no database or HTTP dependency, so they are unit-tested directly.
-- **Same-origin proxy.** Next.js rewrites `/api/*` to the FastAPI service. The browser only ever talks to one origin. This lets the session live in an `httpOnly; Secure; SameSite=Lax` cookie (not readable by JavaScript, so not stealable by XSS), and no CORS configuration is needed.
-- **Synchronous processing.** Ingest + reconcile of a few thousand rows takes milliseconds. Uploads are capped at **2 MB per file**, which keeps the request well under the request-size limits of the Vercel proxy hop. A queue is noted as future work.
+- **Modular monolith.** Parsing and reconciliation are pure functions with no database or HTTP dependency, so they are unit-tested directly:
+  - `(file bytes) → rows + validation report`
+  - `(orders, payments, rules) → results`
+- **Same-origin proxy.** Next.js forwards `/api/*` to FastAPI, so the browser only ever talks to one origin. The session can then live in an httpOnly cookie, and no CORS setup is needed.
+- **Request flow.** Upload both files → validate and reconcile in memory → write everything in one transaction → the dashboard reads the stored results.
+- **Synchronous processing.** A few thousand rows reconcile in milliseconds, so there is no job queue. Uploads are capped at 2 MB per file.
 
-## 3. Stack
+## 3. Key decisions
 
-| Layer | Choice | Why |
+| Area | Decision | Why |
 |---|---|---|
-| Frontend | Next.js (App Router), TypeScript, Tailwind, shadcn/ui | Accessible components, fast to build a clean UI |
-| Charts / table | Recharts, TanStack Table | Recharts underpins shadcn charts; TanStack handles table state |
-| API | FastAPI, Pydantic | Typed request/response contracts, Decimal support |
-| ORM / migrations | SQLAlchemy 2.x, Alembic | Explicit schema, reviewable migrations |
-| Database | PostgreSQL on Neon | Real relational DB, NUMERIC money, free managed tier |
-| Auth | Own: bcrypt password hashing + JWT (HS256) in httpOnly cookie | Small, auditable, no third-party signup friction |
-| LLM | Google Gemini API (Flash-class model), called from the backend only | Brief allows any provider; JSON-schema structured output |
-| Hosting | Vercel (web), Railway (API, no idle sleep), Neon (DB) | No cold start for reviewers |
-| Tests | pytest (engine, ingestion, API, isolation) | |
+| Frontend | Next.js, TypeScript, Tailwind, shadcn/ui, Recharts, TanStack Table | Accessible components; chart and table state handled by mature libraries |
+| Backend | FastAPI, Pydantic, SQLAlchemy 2.x, Alembic | Typed contracts, Decimal support, reviewable migrations |
+| Database | PostgreSQL (Neon) | Relational integrity, exact `NUMERIC` money, managed hosting |
+| Hosting | Vercel (web), Railway (API), Neon (DB) | The API host does not sleep, so there are no cold starts |
+| Auth | Own email + password: bcrypt + JWT in an httpOnly cookie | Small and auditable; no third-party signup step |
+| Isolation | Each import belongs to one user; all data is reached through an owned import | One enforcement point that is easy to test |
+| File storage | Original CSV text + sha256 stored in Postgres | Same transaction as the parsed rows: an import is fully saved or not at all. Object storage is the path for large files |
+| Processing | Synchronous | Fast enough at this size; avoids queue infrastructure |
+| Matching key | `order_id` = `order_reference` after trim + uppercase | The only shared identifier between the two files |
+| Comparison | Order `net_amount` vs settled charge `amount` | What the customer owes vs what was charged; fees are processor cost |
+| Tolerance | 0.05 in the transaction currency, absolute per order | Absorbs rounding noise without hiding real errors |
+| LLM | Gemini, backend only, JSON schema, default temperature, deterministic fallback | Explains results; never decides them (section 10) |
 
-## 4. Authentication and data isolation
+## 4. Data model
 
-- **Signup:** email (trimmed, lower-cased, unique) + password of 8–72 bytes. The upper bound exists because bcrypt only uses the first 72 bytes, so longer passwords are rejected rather than silently truncated. Hashed with bcrypt (per-hash salt, adaptive cost). A successful signup also starts a session.
-- **Login:** the same `401 invalid credentials` response for an unknown email and a wrong password. For an unknown email the server still verifies against a fixed dummy hash, so response time does not reveal which emails exist.
-- **Session:** JWT with `sub` = user id, `exp` = 12 h, signed with `JWT_SECRET` (≥ 32 random bytes) from the environment. Sent as an `httpOnly`, `Secure`, `SameSite=Lax`, `Path=/` cookie. `Secure` is configurable only so local HTTP development works. Logout clears the cookie. Accepted trade-off: there is no server-side revocation or refresh token, so a stolen token is valid until it expires (12 h max).
-- **Authorisation:** every protected route depends on `current_user`. Isolation is enforced at a single point. Every import-scoped request first loads the import with `WHERE id = :id AND user_id = :me`; child rows (orders, payments, results, explanations) are then only ever queried through that owned `import_id`. A resource owned by someone else returns **404, not 403**, so its existence isn't leaked.
-- **CSRF:** the real protection is `SameSite=Lax`. Browsers do not attach the cookie to cross-site POSTs. As defence in depth, every `POST` (including login and signup, which blocks login CSRF) is checked against `APP_ORIGINS`:
-  - If `Origin` is present, it must exactly match one of `APP_ORIGINS`, or the request gets `403`.
-  - If `Origin` is absent, the request falls back to `Referer`. Its scheme + host + port must match one of `APP_ORIGINS`, or the request gets `403`.
-  - If both are absent, the request gets `403`. Current browsers send `Origin` on POST requests, so only non-browser clients hit this case. Those clients don't carry a victim's cookie, so rejecting them costs nothing for the web app. API tests set the header explicitly.
-  - Content-type checks are *not* relied on, because HTML forms can send multipart cross-site.
-- **Rate limiting (minimum before public deployment):** an in-process sliding-window limiter on the abuse-prone endpoints, returning `429` with `Retry-After`.
-  - **Login, hard limit per client IP + normalised email:** 5 failed attempts per 15 min, then `429`. A successful login resets that pair's counter. An attacker who burns the attempts for a victim's email only blocks *their own* IP for that email; the victim, on a different IP, can still sign in.
-  - **Login + signup, hard limit per client IP:** 20 requests per minute, then `429`. This stops one source from spraying many emails or creating accounts in bulk.
-  - **Login, per normalised email across all IPs:** **no hard block.** A hard per-email limit would let any unauthenticated third party lock a known user out (a targeted denial of service), so this layer only **slows** attempts:
-    - after 10 failed attempts for that email within 15 min, every further login attempt for that email waits an extra 1 s, doubling up to a 5 s cap, until the window clears;
-    - the delay is applied *before* the password check and to every attempt for that email, including correct ones, so its presence reveals nothing about whether a password was right;
-    - a legitimate user under attack gets in a few seconds slower, never refused. Combined with bcrypt's cost, this keeps distributed guessing slow.
-  - **No account-existence leak:** counters and delays are keyed on the normalised email string whether or not an account exists. Unknown and known emails get identical status codes, error bodies and throttling behaviour. The generic `401 invalid credentials` is unchanged.
-  - **Explain endpoints, per user:** 10 requests per minute, to cap LLM cost (these require a session, so they can't be triggered against someone else).
-
-  **Client IP source:** behind the Vercel → Railway proxy chain, the socket peer is a proxy, not the user. The client IP is therefore read from `X-Forwarded-For`, counting `TRUSTED_PROXY_HOPS` entries from the right (the entries appended by our own proxies). Entries further left can be forged by the client and are ignored. This has to be verified on the deployed environment before launch. If it is misconfigured, either every user shares one IP bucket, or clients can rotate their apparent IP.
-
-  **Known limits:**
-  - IP-based limits are weaker against attackers spread across many IPs; the per-email delay is the backstop for that.
-  - Users behind one shared NAT share the per-IP budget, but the per-IP + email key means they don't block each other's accounts.
-  - Limits are held in memory: correct for the single API instance in v1, but they reset on restart and are not shared across instances.
-  - CAPTCHA or other step-up verification for suspicious attempts, and a shared store (Redis), are the path when scaling out (section 10).
-- **Frontend guard:** Next.js middleware redirects to `/login` when the cookie is absent. This is UX only; the API is the enforcement point.
-- **Tests** prove that user B cannot list, read, or explain user A's imports or results.
-
-## 5. Data model
-
-| Table | Purpose | Key columns and constraints |
+| Table | Purpose | Main columns |
 |---|---|---|
-| `users` | Accounts | id (uuid PK), email (**unique**, stored lower-case), password_hash, created_at |
-| `imports` | One upload of an orders file + payments file and its reconciliation | id (uuid PK), user_id (FK users, not null), orders_filename, payments_filename, orders_sha256, payments_sha256, orders_raw (text), payments_raw (text), rules_version, summary (jsonb: metrics + validation report), created_at. **Unique (user_id, orders_sha256, payments_sha256, rules_version)** |
-| `orders` | Parsed, de-duplicated, accepted order rows | id, import_id (FK imports, cascade), row_numbers (int[]: all source rows collapsed into this one), order_id_raw, order_key, order_date, customer_email, currency, gross_amount, discount, net_amount, status, raw (jsonb), dq_flags (text[]). **Unique (import_id, order_key)**. Conflicting rows are never inserted here (section 6), so the constraint always holds |
-| `payments` | Parsed, de-duplicated, accepted payment events | id, import_id (FK, cascade), row_numbers, transaction_ref, order_reference_raw, order_key (nullable: blank reference), processed_at, currency, amount, fee, net_settled, type, status, raw (jsonb), dq_flags. **Unique (import_id, transaction_ref)** |
-| `reconciliation_items` | One result per order key, plus one per orphan key and currency. **Includes matched items**, so every headline number drills down to its rows | id, import_id (FK, cascade), item_key (`order:<key>`, `orphan:<key>:<currency>`, or `txn:<transaction_ref>` for a blank reference), order_key (nullable), category, severity, severity_rank (int), currency, expected_amount, actual_amount, difference, reconciled_value, disputed_value, amount_at_risk, risk_direction, reason, dq_flags (text[]), evidence (jsonb: order rows, payment rows, rejected/conflicting row numbers, rule ids, compared values). **Unique (import_id, item_key)**; **unique (id, import_id)**, the target of the composite FK from `explanations` |
-| `explanations` | LLM output cache | id, import_id (FK imports, cascade), item_id (**nullable**: null = whole-run summary), prompt_version, model, output (jsonb), created_at. **Composite FK `(item_id, import_id)` → `reconciliation_items (id, import_id)`**, so an explanation can never point at another import's item; with the default MATCH SIMPLE, a NULL `item_id` (summary) skips the check. **`UNIQUE NULLS NOT DISTINCT (import_id, item_id, prompt_version, model)`**: the run-summary row is also unique (without `NULLS NOT DISTINCT`, Postgres treats NULLs as distinct), and a model change can never serve another model's cached text |
+| `users` | Accounts | id (uuid), email (unique, lower-case), password_hash, created_at |
+| `imports` | One upload of an orders file + payments file, and its result | id, user_id, orders/payments filename, orders/payments sha256, orders/payments raw text, rules_version, summary (jsonb: metrics + validation report), created_at |
+| `orders` | Accepted, de-duplicated order rows | id, import_id, row_numbers (int[]), order_id_raw, order_key, order_date, customer_email, currency, gross_amount, discount, net_amount, status, raw (jsonb), dq_flags (text[]) |
+| `payments` | Accepted, de-duplicated payment events | id, import_id, row_numbers, transaction_ref, order_reference_raw, order_key (null when blank), processed_at, currency, amount, fee, net_settled, type, status, raw (jsonb), dq_flags |
+| `reconciliation_items` | One result per order, per orphan key + currency, or per blank-reference payment. **Matched results are stored too**, so every headline number drills down to its rows | id, import_id, item_key, order_key, category, severity, severity_rank, currency, expected_amount, actual_amount, difference, reconciled_value, disputed_value, amount_at_risk, risk_direction, reason, dq_flags, evidence (jsonb) |
+| `explanations` | Cached LLM output | id, import_id, item_id (null = whole-import summary), prompt_version, model, output (jsonb), created_at |
 
-**Indexes** (beyond PKs and the unique constraints above): `imports (user_id, created_at DESC)` for history; `orders (import_id, order_key)`; `payments (import_id, order_key)`; `reconciliation_items (import_id, severity_rank, amount_at_risk DESC)` for the default "look at these first" ordering; `reconciliation_items (import_id, category)` for filters and chart drill-down.
+**Constraints**
 
-**Integrity constraints** (enforced in the database, not only in code):
-- **Not null:** every required field from section 6, plus `rules_version`, `summary`, `category`, `severity`, `risk_direction`.
-- **Ranges:** `CHECK` that money columns are ≥ 0 (except `difference`, which is signed), and that `amount_at_risk`, `reconciled_value` and `disputed_value` are ≥ 0.
-- **Formats and enums:** `CHECK` that `currency ~ '^[A-Z]{3}$'`, and that `status`, `type`, `category`, `severity` and `risk_direction` are within their allowed sets. These are text with `CHECK` rather than native Postgres enums, so adding a value is a simple migration.
-- **Exclusive buckets:** `CHECK (reconciled_value = 0 OR disputed_value = 0)`, so no item can count in both buckets (section 8).
-- **Email:** `CHECK (email = lower(email))`.
-- **Delete behaviour:** `imports.user_id` uses `ON DELETE RESTRICT` (there is no user deletion in v1); every child FK uses `ON DELETE CASCADE`.
+| Constraint | Purpose |
+|---|---|
+| `imports` unique `(user_id, orders_sha256, payments_sha256, rules_version)` | Re-uploading the same files returns the existing import |
+| `orders` unique `(import_id, order_key)`; `payments` unique `(import_id, transaction_ref)`; `reconciliation_items` unique `(import_id, item_key)` | One row per business key in each import |
+| `explanations` composite FK `(item_id, import_id)` → `reconciliation_items (id, import_id)` | An explanation can only reference an item from its own import. A NULL `item_id` (summary) skips the check |
+| `explanations` `UNIQUE NULLS NOT DISTINCT (import_id, item_id, prompt_version, model)` | One cached explanation per item, prompt version and model. Plain `UNIQUE` would treat NULL summary rows as distinct |
+| `CHECK`: money ≥ 0 (except the signed `difference`); 3-letter currency; status, type, category, severity and direction within allowed sets; `email = lower(email)` | Invalid states cannot be stored |
+| `CHECK (reconciled_value = 0 OR disputed_value = 0)` | An item counts in exactly one bucket |
+| `CHECK (currency IS NOT NULL OR category = 'NEEDS_REVIEW')` | Currency may be unknown only when the evidence is incomplete |
+| Child FKs `ON DELETE CASCADE`; `imports.user_id` `ON DELETE RESTRICT` | Deleting an import removes everything that belongs to it |
 
-Notes:
-- Child tables carry no `user_id`. Ownership lives in one place (`imports.user_id`), so there is no second copy that could drift out of sync. It is enforced by always going through an owned import.
-- Money columns are `NUMERIC(14,2)`, parsed with `Decimal` from the original text. Only currencies with 2 minor units are accepted (see section 6).
-- The original CSV text and its sha256 are stored on the import, so raw values stay available for audit. History/list queries never select the raw columns. Files go in Postgres rather than object storage on purpose. File + rows + results are written in **one transaction**, so an import is either fully saved or not saved at all. With a separate object store, a failure between the two writes leaves orphaned files or rows pointing at missing files. Object storage is the scale path (section 10).
+**Indexes:**
+- `imports (user_id, created_at DESC)` for import history;
+- `orders (import_id, order_key)` and `payments (import_id, order_key)` for grouping;
+- `reconciliation_items (import_id, severity_rank, amount_at_risk DESC)` for the default priority order;
+- `reconciliation_items (import_id, category)` for filters and chart drill-down.
 
-## 5a. Idempotency and failure handling
+Child tables have no `user_id`. Ownership lives only on `imports`, so it cannot drift out of sync. Enum-like columns are text with `CHECK`, so adding a value is a simple migration. List queries never select the raw file columns.
 
-A repeated request must never repeat its side effects. A failure must never leave half-written state.
+## 5. Ingestion
 
-**Import write path, in this order:**
-1. Read both files (size-capped), compute sha256, and parse + validate + reconcile **in memory**. These are pure functions, and nothing is written yet. A file-level error returns `422` here.
-2. `BEGIN`
-3. `INSERT INTO imports … ON CONFLICT (user_id, orders_sha256, payments_sha256, rules_version) DO NOTHING RETURNING id`.
-4. If nothing is returned, the pair was already imported. `ROLLBACK`, read the existing import, and return `200 { already_imported: true }`.
-5. Otherwise bulk-insert orders, payments, and reconciliation items, set the summary, `COMMIT`, and return `201`.
+**Files.** A file is rejected with `422`, and nothing is saved, if:
+- it is not UTF-8 (a BOM is tolerated) or not comma-delimited;
+- it is larger than 2 MB;
+- it is empty;
+- it is missing required headers. This also catches orders and payments swapped between the two upload slots.
 
-Concurrency: if two identical uploads race, the second `INSERT` blocks on the unique index until the first transaction finishes. If the first commits, the second does nothing and returns the existing import. If the first rolls back, the second proceeds. Either way, exactly one import exists. There is no check-then-insert window.
+Header matching ignores case and surrounding spaces. Extra columns are kept in `raw`. A file with headers but no rows is valid and shows a "no records" state.
 
-| Operation | Duplicate / retry behaviour | How it is enforced |
-|---|---|---|
-| Sign up | Same email twice → second gets `409`, no second account | Unique email; the insert catches `IntegrityError` (no check-then-insert race) |
-| Upload + reconcile | Same file pair (same bytes, any filenames) → existing import returned; no new rows, no new run | Unique key + `ON CONFLICT DO NOTHING` (above) |
-| Reconciliation | Re-running on the same inputs gives identical classifications and amounts | Pure deterministic engine; tolerances are code constants tied to `RULES_VERSION`, **not** environment variables, so the same version can never behave differently between deployments |
-| Partial failure during import | Parse error, DB error, or crash mid-import → nothing persists | Single transaction around import + rows + results + summary |
-| LLM explain | Repeated or concurrent clicks for the same item → one stored explanation, returned from cache | `UNIQUE NULLS NOT DISTINCT (import_id, item_id, prompt_version, model)`; insert `ON CONFLICT DO NOTHING`, then read back. Lookup uses the *currently configured* model and prompt version |
-| LLM failure | Timeout, provider error, or invalid output → one retry, then a deterministic fallback | The fallback is returned but **not cached**, so a later click can retry. Reconciliation data is never touched by this path |
-| Frontend double submit | Upload / explain buttons disable while a request is in flight | Client guard; the server-side rules above are the real protection |
+**Fields.** A row missing a required field, or with an invalid value, is **rejected** and listed in the validation report with its row number and reason. It is never coerced, for example to 0. A missing optional field becomes a data-quality flag.
 
-Failure-handling rules:
-- Validation errors are reported with row numbers. Invalid financial values are never coerced to 0.
-- Every external call (LLM) has a timeout, and the total time budget (attempt + retry) stays under 25 s so the proxy hop never times out first. Its failure degrades only the explanation, never the core result.
-- Errors return a consistent JSON shape `{ "error": { "code", "message", "details"? } }` without stack traces or secrets.
-
-## 6. Ingestion contract
-
-**File level:** UTF-8 (BOM tolerated), ≤ 2 MB, comma-delimited, and the header row must contain the required columns (matched case- and whitespace-insensitively; extra columns are ignored and kept in `raw`). These are rejected with `422` and nothing is saved:
-- an empty file
-- missing required headers (this also catches orders and payments swapped between the two upload slots)
-- unreadable encoding
-- an oversize file
-
-A file with headers but zero data rows is valid and produces an explicit "no eligible records" result.
-
-**Required vs optional fields.** A row missing a *required* field is **rejected**. Rejected rows are listed in the validation report with row number and reason, and are never coerced. A missing *optional* field becomes a data-quality flag.
-
-| File | Required | Optional |
+| | Required | Optional |
 |---|---|---|
 | Orders | order_id, currency, net_amount, status | order_date, customer_email, gross_amount, discount |
 | Payments | transaction_ref, currency, amount, type, status | processed_at, order_reference, fee, net_settled |
 
 | Field | Rule |
 |---|---|
-| Order id / order reference | Raw value kept. Match key = `strip().upper()`. When the key differs from the raw value, the row gets flag `reference_normalised` (`ord-1802`, `" ord-1801 "`). A blank order reference becomes an orphan payment keyed by its transaction_ref |
-| Order date | ISO `YYYY-MM-DD HH:MM:SS` |
-| Payment `processed_at` | `DD/MM/YYYY HH:MM`. The column format is fixed because some rows have day > 12, and order-to-charge lags of 1–90 minutes confirm it. Blank → null + flag `missing_timestamp`; timing checks are skipped for that row |
-| Amounts | `Decimal`, at most 2 dp, ≥ 0. Anything else is rejected |
-| Discount | Blank → 0 **only if** gross = net, else flag `amount_inconsistent` |
-| Consistency | `gross − discount = net` and `amount − fee = net_settled`. A mismatch is flagged, not rejected. Matching uses `net_amount` and `amount` |
-| Currency | One of an allow-list of 2-minor-unit ISO codes (e.g. USD, EUR, GBP, INR, AUD, CAD, SGD); others are rejected |
-| Status/type | Orders `completed / cancelled / refunded`; payments type `charge / refund`, status `settled / pending / failed`. Unknown values are rejected |
-| Timezone | Both files are timezone-naive and treated as the same zone; the observed lags support this |
+| Identifiers | Raw value kept; match key = `strip().upper()`. Flagged `reference_normalised` when the key differs from the raw value. A blank order reference makes the payment an orphan keyed by its `transaction_ref` |
+| Dates | Orders `YYYY-MM-DD HH:MM:SS`. Payments `DD/MM/YYYY HH:MM`; this format is fixed for the column because some values have day > 12. Both files are timezone-naive and treated as the same zone. A blank `processed_at` is flagged and skips timing checks |
+| Amounts | `Decimal`, at most 2 decimal places, ≥ 0 |
+| Discount | Blank → 0 only when gross = net; otherwise flagged |
+| Consistency | `gross − discount = net` and `amount − fee = net_settled`; a mismatch is flagged, not rejected |
+| Currency | Allow-list of ISO codes with 2 minor units (USD, EUR, GBP, INR, AUD, CAD, SGD) |
+| Status / type | Orders `completed / cancelled / refunded`; payments `charge / refund` × `settled / pending / failed` |
 
-**Duplicates.** Compared on *parsed* values, so `0` and `0.0` are equal.
-- An exact duplicate order row, or a payment row with the same `transaction_ref`, is collapsed to one record whose `row_numbers` lists every source row. It gets flag `duplicate_row` (ORD-1004).
-- The same `order_id`, or the same `transaction_ref`, with **different** content is an `id_conflict`.
-  - None of the conflicting rows are inserted. They go into the validation report with their raw values, and the affected order key becomes `NEEDS_REVIEW`.
-  - For a `transaction_ref` conflict, that is the key from the conflicting rows' order reference, if they agree on it.
+**Duplicates** are compared on parsed values, so `0` and `0.0` are equal.
+- **Exact duplicate** of an order, or of a payment with the same `transaction_ref`: collapsed into one record whose `row_numbers` lists every source row, and flagged `duplicate_row`.
+- **Same id, different content:** an `id_conflict`. None of the conflicting rows are inserted. They are listed in the validation report, and the key becomes `NEEDS_REVIEW`.
 
-**Linking rejected rows to order keys.** A rejected row is linked to an order key only when a reliable reference can be extracted. All three conditions must hold:
-1. The row was tokenised into the expected number of columns.
-2. Its key field (`order_id` for orders, `order_reference` for payments) is non-blank after `strip().upper()`.
-3. The rejection reason is in a *different* field (e.g. a malformed amount), not in the key itself.
+**Rejected rows and results.** A rejected row is linked to an order key only when all three hold:
+1. the row has the expected number of columns;
+2. its key field is non-blank after normalisation;
+3. the rejection reason is in a different field.
 
-Only then does the key get a `NEEDS_REVIEW` result. Otherwise the row stays **only** in the import-level validation report and does not affect any item, because guessing a key could attach evidence to the wrong order. A linked key that has no accepted order and no accepted payments still gets one `NEEDS_REVIEW` item, so the problem is visible in the drill-down. The validation report always lists every rejected row, linked or not.
+Then that key becomes `NEEDS_REVIEW`. Otherwise the row stays only in the validation report, because guessing a key could attach evidence to the wrong order. This rule stops one malformed payment row from producing a false "missing payment".
 
-## 7. Reconciliation engine
+## 6. Reconciliation
 
-### 7.1 Matching
+### 6.1 Matching
 
-1. Build the order index by `order_key` (after de-duplication).
-2. Group payment events by `order_key`.
-3. Per order, from **settled** events in the **order's currency**: `collected = Σ settled charges − Σ settled refunds`.
-4. Expected net cash by order status: `completed` → `net_amount`; `cancelled` → 0; `refunded` → 0 (a charge followed by a full refund).
-5. `difference = collected − expected`.
-6. Payment groups whose key has no order become **one orphan item per unknown order key and currency**, with all of those events as evidence. A payment with a blank order reference becomes its own orphan item, keyed by `transaction_ref`.
+1. Index orders by `order_key`; group payment events by `order_key`.
+2. Per order, using **settled** events in the **order's currency**:
+   `collected = Σ settled charges − Σ settled refunds`.
+3. Expected cash by order status: `completed` → `net_amount`; `cancelled` → 0; `refunded` → 0.
+4. `difference = collected − expected`.
+5. Payment keys with no order become orphan items, one per key and currency.
 
-Pending and failed events move no money and do not count towards `collected`. A failed attempt followed by a successful charge is normal retry behaviour, not a discrepancy. **Split payments** (several settled charges of different amounts summing to the expected amount) are `MATCHED`. Fees are processor cost: they are validated (2.9% + $0.30 pattern, flag only) but are not part of what the customer owes, so the comparison is order `net_amount` against charge `amount`.
+Pending and failed events move no money, so they are excluded from `collected` but shown as evidence. Some cases that are correct and need no action:
+- a failed attempt followed by a successful charge (a normal retry);
+- several charges summing to the expected amount (a split payment);
+- a refund that brings a duplicate charge or an overcharge back to the expected amount.
 
-**Refund semantics.**
-- **How refunds attach to orders.** The payments export has no link from a refund to the charge it reverses. Refunds are attributed to an order only through `order_reference` and netted **per order**; they are never paired with individual charges.
-- **What the orders export can express.** It has no refund amount and no "partially refunded" status. An order in status `completed` with an unchanged `net_amount` is the order system asserting that the full net amount was kept.
-- **Partial refund on a completed order** (`REFUND_NOT_IN_ORDERS`). Any settled refund that leaves the order short means the order system overstates that order's revenue by the shortfall. The refund itself is present and settled in the processor. What is missing is its reflection in the order system, which is why this is a reconciliation discrepancy rather than a "missing refund".
-  - The refund may well be legitimate (e.g. a goodwill partial refund), so severity is Medium.
-  - The action is to confirm it was authorised and record it against the order.
-- **Order in status `refunded`.** Expects a full refund (net 0). A smaller settled refund is `REFUND_INCOMPLETE`: the customer may still be owed the balance, or the order status is wrong.
-- **Refund without a matching original charge.** Defined per key, as settled refunds exceeding settled charges (net collected < 0), since refunds are not linked to individual charges.
-  - On an order, of any status, this is `OVER_REFUNDED`. Money left the business beyond what was taken for that order.
-  - **Two different amounts for `OVER_REFUNDED`, kept separate on purpose:**
-    - **`amount_at_risk` = −difference** is the *total revenue shortfall* against what the order system expects. This is what the dashboard's money-at-risk KPI sums. It is the same definition every other order category uses (the gap between expected and collected), and it keeps risk monotonic: on a completed order, a larger refund can never show *less* risk than a smaller one.
-    - **`excess_refund` = Σ settled refunds − Σ settled charges** is the cash paid out *beyond anything collected* for that key. It is stored in the item's evidence and shown in the drill-down drawer and reason text. It is **not** added to any KPI, so nothing is counted twice.
-  - Worked example, completed order, expected 100:
+**Refunds.** The payments export does not link a refund to the charge it reverses, so refunds are netted per order through `order_reference`. The orders export has no refund amount or "partially refunded" status. So `completed` with an unchanged `net_amount` asserts the full amount was kept.
+- **Partial refund on a completed order** (`REFUND_NOT_IN_ORDERS`): the refund is settled in the processor, but the order record does not reflect it, so the order system overstates revenue by the shortfall. It may be legitimate (e.g. goodwill); the action is to confirm it and update the order.
+- **Refunded order with a smaller refund** (`REFUND_INCOMPLETE`): the customer may still be owed the balance, or the status is wrong.
+- **Refund without a matching charge** (refunds exceed charges for a key): `OVER_REFUNDED` on an order, or an under-collected orphan when there is no order.
 
-    | Charge | Refund | Collected | Category | `amount_at_risk` (KPI) | `excess_refund` (drawer) |
-    |---|---|---|---|---|---|
-    | 100 | 20 | 80 | `REFUND_NOT_IN_ORDERS` | 20 | 0 |
-    | 100 | 100 | 0 | `REFUND_NOT_IN_ORDERS` | 100 | 0 |
-    | 100 | 120 | −20 | `OVER_REFUNDED` | 120 (100 the order system doesn't know was refunded + 20 paid out beyond the charge) | 20 |
+For `OVER_REFUNDED`, two amounts are kept separate:
 
-    For a refunded or cancelled order (expected 0), the two amounts are equal (e.g. charge 100, refund 120 → both 20).
-  - On a key with no order, it is an `ORPHAN_PAYMENT` with direction under-collected (money paid out against no order).
-  - A refund in a different currency from the order is caught by `CURRENCY_MISMATCH`.
-- **Pending and failed refunds** move no money. They are listed in the evidence and flagged (`pending_refund`) but do not change `collected`.
-
-### 7.2 Tolerances (code constants, versioned by `RULES_VERSION`)
-
-| Rule | Value | Reasoning |
+| Amount | Definition | Used for |
 |---|---|---|
-| Amount tolerance | **0.05 units of the transaction currency** (5 minor units), absolute per order. It only ever compares amounts within one currency, and applies only to the accepted 2-minor-unit currencies (section 6); a currency with different minor units would need its own value and is rejected at ingestion in v1 | In the sample data, observed noise is ≤ 0.02 USD (rounding) and the smallest real error is 18.50 USD. A percentage tolerance would hide large errors on large orders. Items within tolerance are reported as `WITHIN_TOLERANCE`: counted as reconciled but still visible. |
-| Late charge | A settled charge processed **> 7 days** after the order, or **> 1 h before** it | All normal charges land 1–90 min after the order. Card authorisations typically expire after about 7 days, so a capture weeks later suggests a re-charge or wrong linkage. Refunds are exempt. |
+| `amount_at_risk` | `−difference`: total shortfall against the order record | The money-at-risk KPI. It uses the same definition as other categories and rises as the refund grows |
+| `excess_refund` | Σ settled refunds − Σ settled charges | Stored in the evidence and shown in the drill-down only; never added to a KPI |
 
-### 7.3 Classification (first matching rule wins; `tol` = 0.05 in the item's currency)
+Example: a completed order of 100, charged 100 and refunded 120, has 120 at risk and an excess refund of 20.
+
+### 6.2 Tolerances
+
+Tolerances are code constants versioned by `RULES_VERSION` (not environment variables), so a given version always behaves the same.
+
+| Rule | Value | Why |
+|---|---|---|
+| Amount | 0.05 in the transaction currency, absolute, same currency only | In the sample exports, rounding noise is ≤ 0.02 and the smallest real error is 18.50. A percentage tolerance would hide large errors on large orders. Within-tolerance items stay visible |
+| Timing | A settled charge more than 7 days after the order, or more than 1 h before it | Normal charges land within 1–90 min. Card authorisations typically expire after about 7 days. Refunds are exempt |
+
+### 6.3 Classification
+
+First matching rule wins. `tol` is 0.05 in the item's currency.
 
 | # | Category | Condition | Severity | Amount at risk | Direction |
 |---|---|---|---|---|---|
-| 0 | `NEEDS_REVIEW` | The key has an `id_conflict`, or a rejected row is **linked** to it under the rule in section 6 | High | 0 (unknown) | Unverified |
-| 1 | `CURRENCY_MISMATCH` | Any settled or pending event currency ≠ order currency | High | Order net | Unverified |
-| 2 | `MISSING_PAYMENT` | expected > 0 and no payment events at all | High | expected | Under-collected |
+| 0 | `NEEDS_REVIEW` | Id conflict, or a linked rejected row | High | 0 (unknown) | Unverified |
+| 1 | `CURRENCY_MISMATCH` | A settled or pending event's currency ≠ order currency | High | Order net | Unverified |
+| 2 | `MISSING_PAYMENT` | expected > 0, no payment events | High | expected | Under-collected |
 | 3 | `PAYMENT_FAILED` | expected > 0, no settled charge, failed charge(s) only | High | expected | Under-collected |
-| 4 | `PAYMENT_PENDING` | No settled charge and a pending charge exists | Low | Pending amount | Under-collected if expected > 0; over-collected if the order is cancelled/refunded (the charge should be voided) |
-| 5 | `CANCELLED_BUT_CHARGED` | Cancelled, `collected > tol` | High | collected | Over-collected |
-| 6 | `REFUND_INCOMPLETE` | Refunded, `collected > tol` | High | collected | Over-collected |
-| 7 | `OVER_REFUNDED` | `collected < −tol` (refunds exceed charges, i.e. a refund without a matching charge) | High | −difference (total revenue shortfall vs what the order system expects); `excess_refund` is stored separately in the evidence (section 7.1) | Under-collected |
-| 8 | `REFUND_NOT_IN_ORDERS` | Completed, settled refund(s) exist, **and** `difference < −tol` | Medium | −difference | Under-collected (order system overstates revenue) |
-| 9 | `DUPLICATE_CHARGE` | ≥ 2 settled charges each within tol of expected, and `difference > tol` | High | difference | Over-collected |
-| 10 | `OVERCHARGED` | `difference > tol` | High | difference | Over-collected |
-| 11 | `UNDERCHARGED` | `difference < −tol` | Medium | −difference | Under-collected |
-| 12 | `WITHIN_TOLERANCE` | `0 < abs(difference) ≤ tol` | Info | 0 | — |
+| 4 | `PAYMENT_PENDING` | No settled charge, a pending charge exists | Low | Pending amount | Under-collected; over-collected if the order is cancelled/refunded |
+| 5 | `CANCELLED_BUT_CHARGED` | Cancelled, collected > tol | High | collected | Over-collected |
+| 6 | `REFUND_INCOMPLETE` | Refunded, collected > tol | High | collected | Over-collected |
+| 7 | `OVER_REFUNDED` | collected < −tol | High | −difference | Under-collected |
+| 8 | `REFUND_NOT_IN_ORDERS` | Completed, settled refund(s), difference < −tol | Medium | −difference | Under-collected |
+| 9 | `DUPLICATE_CHARGE` | ≥ 2 settled charges each ≈ expected, difference > tol | High | difference | Over-collected |
+| 10 | `OVERCHARGED` | difference > tol | High | difference | Over-collected |
+| 11 | `UNDERCHARGED` | difference < −tol | Medium | −difference | Under-collected |
+| 12 | `WITHIN_TOLERANCE` | 0 < abs(difference) ≤ tol | Info | 0 | — |
 | 13 | `LATE_CHARGE` | Amount agrees, timing rule breached | Low | 0 | — |
 | 14 | `MATCHED` | Everything agrees | — | 0 | — |
-| — | `ORPHAN_PAYMENT` | Payment key has no order (one item per key and currency) | Medium | \|net\| where net = Σ settled charges − Σ settled refunds | Over-collected if net > 0 (unexplained cash); under-collected if net < 0 (refund paid out against no order); none if net = 0 (e.g. pending/failed only) |
+| — | `ORPHAN_PAYMENT` | Payment key with no order | Medium | abs(net settled) | Over-collected if net > 0; under-collected if net < 0 |
 
-Why this order:
-- `NEEDS_REVIEW` is first. If a row about this key was rejected or conflicts, any conclusion would be built on incomplete evidence. Without this rule, a malformed payment row would surface as a false `MISSING_PAYMENT`.
-- A currency mismatch makes every amount comparison meaningless, so it comes before them.
-- Rules 2–3 apply only when money is expected, so a cancelled order with a failed attempt is correctly `MATCHED`.
-- Status-driven rules (5–7) run before the generic amount comparison, so a cancelled-but-charged order is not mislabelled "overcharged".
-- Rule 8 requires the order to actually be short. A refund that *remediates* a duplicate or an overcharge (net collected = expected) is therefore `MATCHED`, not a false discrepancy.
-- A cancelled or refunded order with net collected within tolerance of 0 is correct and is `MATCHED`.
+**Why this order:**
+- Incomplete evidence comes first, so no other conclusion is drawn from it.
+- A currency mismatch makes amount comparisons meaningless, so it comes before them.
+- Missing/failed rules apply only when money is expected, so a cancelled order with a failed attempt is correctly `MATCHED`.
+- Status rules come before the generic amount rules, so a cancelled-but-charged order is not called "overcharged".
 
-Secondary signals that don't change the category are attached as `dq_flags` and shown in the drawer: a timing breach when another category won, a pending charge alongside settled ones, a fee mismatch.
+Signals that don't change the category are attached as `dq_flags`: a timing breach when another category won, a pending charge next to settled ones, a fee mismatch.
 
-Severity reflects the order of action: **customer harm first** (they were charged wrongly, so there is chargeback and trust risk), then **revenue leakage**, then hygiene. Default ordering: `severity_rank`, then `amount_at_risk` descending, then `order_key`. Amounts in different currencies are compared only for ordering, never summed.
+**Severity** follows the order of action: customer harm first (wrong charges, refunds owed), then revenue leakage, then hygiene. The default sort is severity, then amount at risk descending, then order key.
 
-### 7.4 Data-quality notes (not discrepancies)
+**Determinism.** No randomness, clock reads, LLM calls, or dependence on row order happen inside the engine. Output is sorted by a stable key.
 
-Normalised references, blank optional fields, collapsed duplicate rows, fee/consistency mismatches, and missing timestamps are attached as `dq_flags` on the source rows and the item. Rejected rows live in the import's validation report. A "Data quality" view lists both. Data-quality notes never add to the dispute totals.
+## 7. Metrics
 
-### 7.5 Determinism
-
-- No randomness, no wall-clock time inside the engine, no LLM, no dependence on input row order or dict iteration order.
-- Output is sorted by the stable key above.
-- Tests: shuffle the input rows and assert an identical result; a golden test pins the category of every order in the sample data plus the headline totals (section 13).
-
-## 8. Headline metrics (per currency, never summed across currencies)
+All metrics are grouped by currency and never summed across currencies. They are plain sums over `reconciliation_items`, so clicking a metric filters the table to exactly the rows behind it.
 
 | Metric | Definition |
 |---|---|
 | Total orders | Unique order keys (raw row count shown alongside) |
-| Total payments | Payment events (charges / refunds by status) and settled charge value |
-| Value reconciled | Σ `reconciled_value`, grouped by currency |
-| Value in dispute | Σ `disputed_value`, grouped by currency |
-| Money at risk | Σ `amount_at_risk`, grouped by currency and `risk_direction`: **under-collected** (store is short; pending is shown as a labelled portion of this), **over-collected** (owed to customers or unexplained cash), and **unverified** (currency mismatch). `NEEDS_REVIEW` items have unknown exposure, so they are shown as a **count** next to the unverified amount, not as money |
-
-**Per-category value formulas.** These are computed by the engine and stored on each item, in the item's currency:
+| Total payments | Payment events by type and status, and settled charge value |
+| Value reconciled | Σ `reconciled_value` |
+| Value in dispute | Σ `disputed_value`: how much business is affected |
+| Money at risk | Σ `amount_at_risk` by direction: **under-collected** (store is short; the pending part is labelled), **over-collected** (owed to customers or unexplained cash), **unverified** (currency mismatch). `NEEDS_REVIEW` items are shown as a count, because their exposure is unknown |
 
 | Category | `reconciled_value` | `disputed_value` |
 |---|---|---|
-| `MATCHED`, `WITHIN_TOLERANCE`, `LATE_CHARGE` | expected (order net for completed orders; 0 for cancelled/refunded orders that correctly net to 0) | 0 |
-| `NEEDS_REVIEW` | 0 | order net if an accepted order exists. Otherwise Σ amounts of the key's accepted settled events (charges + refunds), if they are all in one currency. Otherwise 0 with currency NULL: value unknown, so it is counted only by item count. This is the only case where an item's currency may be NULL, enforced by `CHECK (currency IS NOT NULL OR category = 'NEEDS_REVIEW')` |
-| `CURRENCY_MISMATCH` | 0 | order net, in the **order's** currency. The payment amounts are in another currency, so they appear in the evidence only and are never added to any total |
-| `ORPHAN_PAYMENT` | 0 | Σ settled charge amounts + Σ settled refund amounts for that key and currency: the gross money that moved with no order behind it |
-| every other order category | 0 | order net |
+| `MATCHED`, `WITHIN_TOLERANCE`, `LATE_CHARGE` | expected | 0 |
+| `NEEDS_REVIEW` | 0 | Order net if an order exists. Otherwise the settled event amounts if they are all in one currency. Otherwise 0, with currency unknown |
+| `CURRENCY_MISMATCH` | 0 | Order net in the order's currency; the foreign-currency payment appears in the evidence only |
+| `ORPHAN_PAYMENT` | 0 | Σ settled charge + refund amounts for that key and currency |
+| Other order categories | 0 | Order net |
 
 **No double counting:**
-- Each accepted order belongs to exactly one item, and each accepted payment event to exactly one item (its order's item, its orphan item, or its own blank-reference item). The engine asserts this, and a test checks it.
-- Each item has one category and one `risk_direction`.
-- `reconciled_value` and `disputed_value` are mutually exclusive (database `CHECK`).
-- Totals are plain sums over items grouped by currency; payments counts come from the `payments` table, not from items.
+- each accepted order and each accepted payment belongs to exactly one item;
+- each item has one category and one direction;
+- the database ensures an item counts as either reconciled or disputed, never both.
 
-"In dispute" is how much business is affected. "At risk" is how much money is actually wrong. For example, ORD-1401 is 92.81 USD in dispute but 25.00 USD at risk. Every metric is a sum over `reconciliation_items`, so clicking it filters the table to exactly the rows behind it.
+Example: an order of 92.81 charged 117.81 has 92.81 in dispute and 25.00 at risk.
 
-## 9. LLM explanations
+## 8. Idempotency and failure handling
 
-- **Where:** backend endpoints `POST /api/imports/{id}/items/{item_id}/explain` and `POST /api/imports/{id}/summary/explain`. The API key lives only in the backend environment.
-- **Input:** a compact evidence object (category, rule, expected/actual/difference, currencies, statuses, event list, timestamps). **No customer email or other PII is sent.** The run summary sends the metrics plus at most the top 20 items, so prompt size is bounded.
-- **Prompt-injection guard:** CSV values (ids, statuses) are untrusted. They are passed as a JSON data block, and the system instruction says to treat them as data and to explain only what the evidence supports. The output is constrained by a schema and rendered as plain text in the UI, never as HTML.
-- **Output (JSON schema):** `{ summary, likely_cause, recommended_actions[1..4], confidence: low|medium|high }`; for a run summary, `{ headline, top_issues[], recommended_priorities[] }`. String lengths and array sizes are capped.
+A repeated request never repeats its side effects, and a failure never leaves half-written data.
+
+**Import write path:**
+1. Read both files, hash them, then parse, validate and reconcile in memory.
+2. `BEGIN`, then `INSERT INTO imports … ON CONFLICT DO NOTHING RETURNING id`.
+3. If no row is returned, the same pair already exists: roll back and return it (`200`, `already_imported: true`).
+4. Otherwise insert the orders, payments and items, then `COMMIT` (`201`).
+
+If two identical uploads arrive together, the second insert waits on the unique index. It then either finds the committed import or proceeds if the first rolled back. There is no check-then-insert gap.
+
+| Operation | Repeated or failing request |
+|---|---|
+| Sign up | Same email → `409`; the unique index and a caught `IntegrityError` close the race |
+| Upload | Same file pair → the existing import is returned; no new rows |
+| Reconcile | Same input → identical result (pure engine, versioned rules) |
+| Import failure | Rolled back as one transaction; nothing persists |
+| Explain | Repeated or concurrent clicks → one cached row (`ON CONFLICT DO NOTHING`, then read back) |
+| LLM failure | One retry, then a deterministic fallback, which is not cached so a later click can retry; reconciliation data is never touched |
+| Double submit in UI | Buttons disable while a request is in flight |
+
+Errors use one shape, `{ "error": { "code", "message", "details"? } }`, with no stack traces or secrets.
+
+## 9. Authentication and security
+
+- **Accounts:**
+  - The email is trimmed, lower-cased and unique. The password must be 8–72 bytes: bcrypt reads only 72 bytes, so longer passwords are rejected rather than silently truncated.
+  - Signup starts a session.
+  - Login returns the same `401` for an unknown email and a wrong password. It verifies against a dummy hash for unknown emails, so timing reveals nothing.
+- **Session:**
+  - A JWT (`sub` = user id, 12 h expiry, signed with `JWT_SECRET`) in an `httpOnly; Secure; SameSite=Lax; Path=/` cookie.
+  - `Secure` can be disabled only for local HTTP.
+  - Logout clears the cookie. Trade-off: there is no server-side revocation, so a stolen token works until it expires.
+- **Isolation:**
+  - Every import-scoped request loads the import with `WHERE id = :id AND user_id = :me`. Child data is only queried through that import.
+  - Another user's resources return `404`, so their existence is not revealed.
+- **CSRF:**
+  - `SameSite=Lax` stops browsers sending the cookie on cross-site POSTs.
+  - Every `POST`, including login and signup, also checks `Origin` against `APP_ORIGINS`. If `Origin` is missing, `Referer` is checked instead. If both are missing, the request is rejected with `403`. Browsers always send `Origin` on POST, and non-browser clients don't carry the user's cookie anyway.
+- **Rate limiting** (in memory, `429` with `Retry-After`):
+  - Login: 5 failed attempts per client IP + email per 15 min. A success resets the counter. An attacker can block only their own IP, never the account.
+  - Login + signup: 20 requests per client IP per minute.
+  - Per email across all IPs, there is no hard block. After 10 failures in 15 min, each attempt is delayed by 1 s, doubling up to 5 s. The delay happens before the password check and applies to correct attempts too, so a real user is slowed, never locked out.
+  - Counters key on the email text whether or not an account exists, so throttling does not reveal accounts.
+  - Explain endpoints: 10 per user per minute, to cap LLM cost.
+- **Client IP** comes from `X-Forwarded-For`, counting `TRUSTED_PROXY_HOPS` entries from the right. Entries further left can be forged and are ignored. This value must be verified on the deployed proxy chain.
+- **Frontend guard:** middleware redirects to `/login` without a session. This is for UX only; the API enforces access.
+
+## 10. LLM explanations
+
+- **Endpoints:** explain one item, or summarise a whole import. Both run on the backend; the API key is never sent to the browser.
+- **Input:**
+  - A compact evidence object: category, rule, amounts, currencies, statuses, events, timestamps.
+  - No customer email or other personal data.
+  - The summary sends the metrics plus the top 20 items.
+- **Prompt injection:** CSV values are untrusted. They are passed as a JSON data block, with instructions to treat them as data and explain only what the evidence supports. Output is rendered as plain text.
+- **Output schema:**
+  - For one item: `{ summary, likely_cause, recommended_actions[1..4], confidence }`.
+  - For the summary: `{ headline, top_issues[], recommended_priorities[] }`.
+  - Lengths are capped. Every response is validated with Pydantic.
 - **Parameters:**
-  - **Model:** a Gemini Flash-class model (configured by `GEMINI_MODEL`).
-  - **Temperature:** left at the **provider default of 1.0**. This is deliberate. For the Gemini 3 family, Google recommends keeping temperature at 1.0 and warns that lowering it can cause looping or degraded output.
-  - **Where consistency comes from instead:** the JSON schema; low `thinking_level` (the task is summarising given facts, not open reasoning, so this also cuts latency and cost); a capped output length; and the **cache**, which makes each item's explanation generated once and then stable for every viewer.
-  - If an older non-reasoning model is configured instead, a low temperature (≈ 0.2) is the right choice for that model. The setting lives next to the model choice for that reason.
-- **Bad responses:** a provider error, timeout, non-JSON output, or schema violation (validated with Pydantic) leads to one retry. If that also fails, the API returns a **deterministic template explanation** built from the evidence, marked `source: "fallback"`. The UI shows which source produced the text. The reconciliation result never depends on the LLM.
-- **Cache key:** import + item + prompt version + **model id**. The configured model is part of the key itself, so changing `GEMINI_MODEL` can never serve another model's cached text, even if nobody bumps `PROMPT_VERSION`. Changing the prompt still requires bumping `PROMPT_VERSION`. Older cached rows stay as history and are not shown.
-
-## 10. Deliberate cuts (and how to add them back)
-
-| Cut | Reason | Path forward |
-|---|---|---|
-| Organisations / memberships / roles | The requirement is per-user isolation | Add `tenants` + `memberships`; swap the `user_id` check on `imports` for `tenant_id` |
-| Object storage for files | Files are KB-sized and stored in Postgres with a hash, in the same transaction | S3 with private keys + signed URLs |
-| Background queue | Synchronous processing finishes in milliseconds | Worker + job table; the job carries ids and re-checks ownership |
-| Refresh tokens, revocation, password reset | Out of scope for 24 h | Rotating refresh token + server-side session table, email reset flow |
-| Shared rate limiting, step-up verification | v1 ships an in-memory limiter with IP hard limits and per-email progressive delay (section 4), which is correct for one API instance | Move the counters to Redis when running more than one instance; add CAPTCHA or another step-up check after repeated failures for an email |
-| Postgres row-level security | One enforced query path + tests | RLS as defence in depth |
-| FX conversion | No agreed rate source | Rates table with source and timestamp |
+  - Temperature stays at the default 1.0. Google recommends this for the Gemini 3 family, because lower values can cause looping or degraded output.
+  - Consistency comes from the schema, a low thinking level, capped output, and caching: each explanation is generated once and then stays stable.
+  - If a non-reasoning model is configured instead, a low temperature (about 0.2) is the right setting.
+- **Failure:** on a timeout, provider error, invalid JSON or schema violation, retry once (total under 25 s). If that also fails, return a template explanation built from the evidence, marked `source: "fallback"`.
+- **Cache key:** import + item + prompt version + model, so changing the model or the prompt never serves stale text.
 
 ## 11. API
 
 | Method | Path | Purpose | Responses |
 |---|---|---|---|
-| POST | `/api/auth/signup` | Create account + session | 201, 409 email taken, 422 invalid |
-| POST | `/api/auth/login` | Session | 200, 401 |
-| POST | `/api/auth/logout` | Clear session | 204 |
+| POST | `/api/auth/signup` | Create account and session | 201, 409, 422, 429 |
+| POST | `/api/auth/login` | Start session | 200, 401, 429 |
+| POST | `/api/auth/logout` | End session | 204 |
 | GET | `/api/auth/me` | Current user | 200, 401 |
-| POST | `/api/imports` | Multipart `orders` + `payments` → validate, store, reconcile | 201 new, 200 `already_imported`, 413 too large, 422 file errors |
-| GET | `/api/imports` | The user's import history (newest first, no raw file content) | 200 |
-| GET | `/api/imports/{id}` | Summary metrics + validation report (rejected rows) | 200, 404 |
-| GET | `/api/imports/{id}/items` | Filters: `category`, `severity`, `direction`, `currency`, `has_dq`, `q` (order id / transaction ref / email); `sort`; `page`, `page_size`. Defaults to non-matched items, sorted by priority | 200, 404 |
-| GET | `/api/imports/{id}/items/{item_id}` | Full evidence + cached explanation if one exists | 200, 404 |
-| POST | `/api/imports/{id}/items/{item_id}/explain` | LLM explanation (or fallback) | 200, 404 |
-| POST | `/api/imports/{id}/summary/explain` | LLM summary of the whole run | 200, 404 |
-| GET | `/api/health` | Liveness (no config details) | 200 |
+| POST | `/api/imports` | Upload `orders` + `payments` (multipart), validate, reconcile | 201, 200 (`already_imported`), 413, 422 |
+| GET | `/api/imports` | Import history, newest first | 200 |
+| GET | `/api/imports/{id}` | Metrics and validation report | 200, 404 |
+| GET | `/api/imports/{id}/items` | Results. Filters: `category`, `severity`, `direction`, `currency`, `has_dq`; search `q` (order id, transaction ref, email); sort; pagination. Defaults to non-matched items by priority | 200, 404 |
+| GET | `/api/imports/{id}/items/{item_id}` | Evidence plus any cached explanation | 200, 404 |
+| POST | `/api/imports/{id}/items/{item_id}/explain` | Explain one result | 200, 404, 429 |
+| POST | `/api/imports/{id}/summary/explain` | Summarise the import | 200, 404, 429 |
+| GET | `/api/health` | Liveness | 200 |
 
-All non-2xx responses use the error shape from section 5a. Unauthenticated requests get `401`.
+Every route except signup, login and health requires a session (`401` otherwise).
 
 ## 12. UI
 
 1. **Login / Sign up.**
-2. **Imports:** upload both files (drag and drop, with client-side checks for type and size), see the validation report (rejected rows with reasons), and the import history.
-3. **Dashboard** (latest import by default, switchable from history):
-   - KPI row: orders, payments, reconciled, in dispute, money at risk (under / over / unverified).
-   - Chart: money at risk by category. Clicking a bar filters the table.
-   - **"Look at these first"** table: severity, category, order, expected vs actual, at risk. It has filters, search, and sorting. Clicking a KPI filters the table; the "reconciled" KPI shows matched items.
-   - Row → side drawer with evidence (source rows with row numbers), data-quality notes, and an **Explain with AI** button (loading, error, and fallback states).
-   - Tabs: Discrepancies · Data quality · AI summary.
-   - Explicit states: no imports yet, upload in progress, file rejected, imported with warnings, zero discrepancies, and session expired (redirect to login).
+2. **Imports:** drag-and-drop for both files, with type and size checks; the validation report with rejected rows and reasons; import history.
+3. **Dashboard:**
+   - **KPI row:** orders, payments, reconciled, in dispute, money at risk (under / over / unverified).
+   - **Chart:** money at risk by category. Clicking a bar filters the table.
+   - **"Look at these first" table:** severity, category, order, expected vs actual, at risk; with filters, search and sorting. Clicking a KPI filters it too.
+   - **Row drawer:** evidence with source row numbers, data-quality notes, and **Explain with AI**, with loading, error and fallback states.
+   - **Tabs:** Discrepancies · Data quality · AI summary.
+   - **States:** no imports, uploading, file rejected, imported with warnings, nothing to reconcile, session expired.
 
 ## 13. Testing
 
-- **Engine:** a golden test pinning every order's category in the sample files and the headline totals:
-  - under-collected $886.85
-  - over-collected $936.58
-  - unverified USD 210.00 + EUR 145.00
-  - reconciled $39,963.28 across 168 orders
-  - in dispute 2,469.37 USD + 145.00 EUR
+- **Engine (golden):**
+  - The category of every order in the sample exports is pinned.
+  - Pinned totals:
+    - under-collected 886.85 USD; over-collected 936.58 USD;
+    - unverified 210.00 USD + 145.00 EUR;
+    - reconciled 39,963.28 USD across 168 orders;
+    - in dispute 2,469.37 USD + 145.00 EUR.
+  - The same result is expected after shuffling input rows.
+- **Engine (rules):**
+  - Tolerance edges: 0.05 → within tolerance; 0.06 → mismatch.
+  - Correct cases: a split payment, a duplicate charge later refunded, and an overcharge corrected by a refund all reconcile as `MATCHED`.
+  - Cancelled orders: with only a failed attempt → `MATCHED`; with a pending charge → pending, over-collected.
+  - Refunded order with no events → `MATCHED`.
+  - A rejected row with a readable key → `NEEDS_REVIEW`; with a blank key → validation report only.
+  - Refund-only orphan → under-collected.
+  - Every order and payment belongs to exactly one item.
+  - Refund boundaries (order net 100):
 
-  Plus the row-shuffle determinism test, and unit tests for:
-  - tolerance edges (0.05 → within, 0.06 → mismatch)
-  - split payment → matched
-  - duplicate charge later refunded → matched
-  - overcharge corrected by a partial refund → matched
-  - cancelled with failed charge → matched
-  - cancelled with pending charge → pending, over-collected
-  - refunded with no events → matched
-  - refunds exceeding charges → over-refunded
-  - completed with partial refund → refund not recorded
-  - a rejected payment row with a readable order reference → that order becomes needs review (not missing payment)
-  - a rejected row with a blank or unreadable key → validation report only; no item is affected
-  - refund boundary cases (order net = 100 in every row; all events settled, same currency; expected = 100 for completed, 0 for refunded):
+  | Status | Charge | Refund | Category | At risk | Excess refund |
+  |---|---|---|---|---|---|
+  | refunded | 100 | 80 | `REFUND_INCOMPLETE` | 20 | 0 |
+  | refunded | 100 | 120 | `OVER_REFUNDED` | 20 | 20 |
+  | completed | 100 | 20 | `REFUND_NOT_IN_ORDERS` | 20 | 0 |
+  | completed | 100 | 100 | `REFUND_NOT_IN_ORDERS` | 100 | 0 |
+  | completed | 100 | 120 | `OVER_REFUNDED` | 120 | 20 |
+  | completed | — | 30 | `OVER_REFUNDED` | 130 | 30 |
 
-    | Order status | Charge | Refund | Category | `amount_at_risk` | Direction | `excess_refund` |
-    |---|---|---|---|---|---|---|
-    | refunded | 100 | 80 | `REFUND_INCOMPLETE` | 20 | over-collected | 0 |
-    | refunded | 100 | 120 | `OVER_REFUNDED` | 20 | under-collected | 20 |
-    | completed | 100 | 20 | `REFUND_NOT_IN_ORDERS` | 20 | under-collected | 0 |
-    | completed | 100 | 100 | `REFUND_NOT_IN_ORDERS` | 100 | under-collected | 0 |
-    | completed | 100 | 120 | `OVER_REFUNDED` | 120 | under-collected | 20 |
-    | completed (refund only) | — | 30 | `OVER_REFUNDED` | 130 | under-collected | 30 |
-  - refund-only orphan → orphan, under-collected
-  - every accepted order and payment belongs to exactly one item
-  - currency mismatch never summed across currencies
 - **Ingestion:**
-  - DD/MM date parsing and blank timestamps
-  - blank discount (gross = net vs gross ≠ net)
-  - reference normalisation
-  - exact-duplicate collapse vs id conflict
-  - missing headers / swapped files
-  - header-only file and empty file
-  - > 2 dp, negative and malformed amounts
-  - unknown currency or status
-  - oversize file
-- **API / security:**
-  - signup/login/logout and duplicate signup → 409
-  - password > 72 bytes → 422
-  - unauthenticated → 401 and cookie flags set
-  - POST with a foreign `Origin` → 403
-  - POST with no `Origin` but a matching `Referer` → allowed
-  - POST with neither header → 403
-  - 6th failed login from one IP for one email within 15 min → 429 with `Retry-After`; a successful login resets that pair
-  - the same email from a *different* IP is not refused after another IP exhausted its attempts (the victim can still sign in)
-  - after 10 failures for an email across IPs → attempts are delayed (1 s, doubling to a 5 s cap) but never refused, including the correct password
-  - 21st login/signup request from one IP within a minute → 429
-  - unknown vs known email → identical status codes, bodies and throttling
-  - client IP is taken from the trusted `X-Forwarded-For` hop; a client-supplied leftmost entry does not change the bucket
-  - explain beyond the per-user limit → 429
-  - cross-user list/read/explain → 404
-  - same file pair uploaded twice (sequentially and concurrently) → one import
-  - import failure mid-write → no partial rows
-  - explain twice → one cached row, including the run summary
-  - changing the configured model → a new explanation, not the old model's cached one
-  - an explanation pointing at another import's item is rejected by the composite FK
-  - LLM timeout / malformed JSON / schema violation → fallback, not cached
-- The sample CSVs **will be added** under `backend/tests/fixtures/` together with the engine tests. As of this design revision they are **not** in the repository.
+  - date formats and blank timestamps;
+  - blank discount;
+  - normalisation;
+  - duplicates vs conflicts;
+  - missing headers, swapped files, empty and header-only files;
+  - invalid amounts, currencies and statuses;
+  - oversize files.
+- **API and security:**
+  - **Auth:** signup, login and logout; duplicate signup; passwords over 72 bytes; cookie flags; unauthenticated → `401`; another user's data → `404`.
+  - **Origin:** a foreign `Origin` → `403`; `Referer` fallback; both missing → `403`.
+  - **Rate limits:**
+    - an IP + email limit hit → `429`, but a different IP is still allowed;
+    - the per-email delay never refuses a correct password;
+    - unknown and known emails behave the same;
+    - a forged forwarded IP is ignored.
+  - **Idempotency and failures:** repeat and concurrent uploads → one import; a mid-import failure → no rows; repeat explain → one cached row; a model change → a new explanation; a cross-import explanation is blocked by the FK; LLM timeout or malformed output → fallback.
+- The sample CSVs are added under `backend/tests/fixtures/` with the engine tests.
 
-## 14. Configuration (`.env.example`, no real values)
+## 14. Configuration
 
 | Variable | Used by | Purpose |
 |---|---|---|
-| `DATABASE_URL` | API, migrations | Postgres connection string. Use Neon's **direct (non-pooled)** endpoint: transaction-mode poolers break prepared statements, and the single API instance holds a small pool itself |
+| `DATABASE_URL` | API, migrations | Postgres connection string. Use Neon's direct (non-pooled) endpoint, because transaction-mode poolers break prepared statements |
 | `JWT_SECRET` | API | ≥ 32 random bytes |
 | `COOKIE_SECURE` | API | `true` in production, `false` only for local HTTP |
-| `APP_ORIGINS` | API | Comma-separated exact origins allowed for `POST` requests (e.g. the production web URL; add `http://localhost:3000` locally) |
-| `TRUSTED_PROXY_HOPS` | API | Number of our own proxies in front of the API (Vercel + Railway); used to read the real client IP from `X-Forwarded-For`. `0` locally |
-| `GEMINI_API_KEY` | API | LLM key (backend only) |
+| `APP_ORIGINS` | API | Comma-separated origins allowed for `POST` |
+| `TRUSTED_PROXY_HOPS` | API | Number of proxies in front of the API, used to read the client IP; `0` locally |
+| `GEMINI_API_KEY` | API | LLM key |
 | `GEMINI_MODEL` | API | Model id |
-| `API_BASE_URL` | Web (server-side) | Target of the `/api/*` rewrite |
+| `API_BASE_URL` | Web (server) | Target of the `/api/*` rewrite |
 
-## 15. Delivery order
+## 15. Future work
 
-1. Engine + ingestion + tests
-2. DB models, migrations, auth, API
-3. Frontend: auth, upload, dashboard, drill-down
-4. LLM explanations + fallback
-5. Deploy (Neon → Railway → Vercel)
-6. README: setup, architecture, reconciliation logic, findings, LLM approach, next steps, AI-tool usage; `.env.example`; demo credentials
+| Item | When it becomes worth it |
+|---|---|
+| Organisations, shared workspaces, roles | Teams need shared access: add `tenants` + `memberships` and scope imports by tenant |
+| Object storage for files | Files grow beyond a few MB: S3 with private keys and signed URLs |
+| Background processing | Imports grow beyond synchronous limits: a worker and job table that re-checks ownership |
+| Refresh tokens, revocation, password reset | Longer sessions or account recovery are needed |
+| Shared rate limits, step-up checks | More than one API instance (Redis counters), or sustained attacks (CAPTCHA after repeated failures) |
+| Postgres row-level security | Defence in depth for isolation |
+| FX conversion | A trusted rate source is available: rates table with source and timestamp |
