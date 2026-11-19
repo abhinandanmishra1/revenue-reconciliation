@@ -73,7 +73,7 @@ Also check that the cookie in DevTools → Application → Cookies is `HttpOnly`
 ## Local stack
 
 ```bash
-cp .env.example .env   # set JWT_SECRET; Gemini values are optional
+cp .env.example .env   # set JWT_SECRET and POSTGRES_PASSWORD; Gemini values are optional
 docker compose up --build
 ```
 

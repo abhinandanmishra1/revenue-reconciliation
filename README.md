@@ -12,7 +12,7 @@ Upload an orders export and a payment-processor export, and see on one dashboard
 ### Everything at once (Docker)
 
 ```bash
-cp .env.example .env        # set JWT_SECRET; GEMINI_* are optional
+cp .env.example .env        # set JWT_SECRET and POSTGRES_PASSWORD; GEMINI_* are optional
 docker compose up --build
 ```
 
