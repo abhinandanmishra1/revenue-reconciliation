@@ -1,6 +1,14 @@
 # Design — Revenue Reconciliation Dashboard
 
-> Status: **agreed design** (v1.1). v1 replaced the earlier multi-tenant proposal. v1.1 fixes classification precedence edge cases, defines the ingestion contract and indexes, and corrects the LLM temperature decision after checking current provider guidance. Every cut is recorded in section 10 with the path to add it back.
+> Status: **agreed design** (v1.2). v1 is a per-user workspace (each user's data is private to them), replacing the earlier multi-tenant proposal. v1.1 fixed classification precedence, defined the ingestion contract and indexes, and corrected the LLM temperature decision. v1.2 defines:
+> - how rejected rows link to results
+> - refund semantics
+> - a currency-neutral tolerance
+> - per-category dispute formulas
+> - database constraints
+> - minimum auth hardening
+>
+> Every cut is recorded in section 10 with the path to add it back.
 
 ## 1. Goals
 
@@ -50,7 +58,17 @@ Browser ──► Next.js (Vercel)
 - **Login:** the same `401 invalid credentials` response for an unknown email and a wrong password. For an unknown email the server still verifies against a fixed dummy hash, so response time does not reveal which emails exist.
 - **Session:** JWT with `sub` = user id, `exp` = 12 h, signed with `JWT_SECRET` (≥ 32 random bytes) from the environment. Sent as an `httpOnly`, `Secure`, `SameSite=Lax`, `Path=/` cookie. `Secure` is configurable only so local HTTP development works. Logout clears the cookie. Accepted trade-off: there is no server-side revocation or refresh token, so a stolen token is valid until it expires (12 h max).
 - **Authorisation:** every protected route depends on `current_user`. Isolation is enforced at a single point. Every import-scoped request first loads the import with `WHERE id = :id AND user_id = :me`; child rows (orders, payments, results, explanations) are then only ever queried through that owned `import_id`. A resource owned by someone else returns **404, not 403**, so its existence isn't leaked.
-- **CSRF:** the real protection is `SameSite=Lax`. Browsers do not attach the cookie to cross-site POSTs. As defence in depth, state-changing requests (`POST`) must carry an `Origin` header matching the configured app origin; otherwise they get `403`. Content-type checks are *not* relied on, because HTML forms can send multipart cross-site.
+- **CSRF:** the real protection is `SameSite=Lax`. Browsers do not attach the cookie to cross-site POSTs. As defence in depth, every `POST` (including login and signup, which blocks login CSRF) is checked against `APP_ORIGINS`:
+  - If `Origin` is present, it must exactly match one of `APP_ORIGINS`, or the request gets `403`.
+  - If `Origin` is absent, the request falls back to `Referer`. Its scheme + host + port must match one of `APP_ORIGINS`, or the request gets `403`.
+  - If both are absent, the request gets `403`. Current browsers send `Origin` on POST requests, so only non-browser clients hit this case. Those clients don't carry a victim's cookie, so rejecting them costs nothing for the web app. API tests set the header explicitly.
+  - Content-type checks are *not* relied on, because HTML forms can send multipart cross-site.
+- **Rate limiting (minimum before public deployment):** an in-process sliding-window limiter on the abuse-prone endpoints, returning `429` with `Retry-After`.
+  - Login: 5 failed attempts per normalised email per 15 min. This is a throttle, not a permanent lockout, so an attacker cannot lock a victim out of their account.
+  - Login + signup: 20 requests per client IP per minute.
+  - Explain endpoints: 10 requests per user per minute, to cap LLM cost.
+
+  The per-email and per-user limits don't depend on IP addresses, so they are the reliable layer. The per-IP limit uses the client address forwarded by the proxy chain and is best-effort, because forwarded headers can be influenced by clients. Limits are held in memory: correct for the single API instance in v1, but they reset on restart and are not shared across instances. A shared store (Redis) is the path when scaling out (section 10).
 - **Frontend guard:** Next.js middleware redirects to `/login` when the cookie is absent. This is UX only; the API is the enforcement point.
 - **Tests** prove that user B cannot list, read, or explain user A's imports or results.
 
@@ -60,12 +78,20 @@ Browser ──► Next.js (Vercel)
 |---|---|---|
 | `users` | Accounts | id (uuid PK), email (**unique**, stored lower-case), password_hash, created_at |
 | `imports` | One upload of an orders file + payments file and its reconciliation | id (uuid PK), user_id (FK users, not null), orders_filename, payments_filename, orders_sha256, payments_sha256, orders_raw (text), payments_raw (text), rules_version, summary (jsonb: metrics + validation report), created_at. **Unique (user_id, orders_sha256, payments_sha256, rules_version)** |
-| `orders` | Parsed, de-duplicated order rows | id, import_id (FK imports, cascade), row_numbers (int[]: all source rows collapsed into this one), order_id_raw, order_key, order_date, customer_email, currency, gross_amount, discount, net_amount, status, raw (jsonb), dq_flags (text[]) |
-| `payments` | Parsed payment events | id, import_id (FK, cascade), row_numbers, transaction_ref, order_reference_raw, order_key, processed_at, currency, amount, fee, net_settled, type, status, raw (jsonb), dq_flags |
-| `reconciliation_items` | One result per order key, plus one per orphan key. **Includes matched items**, so every headline number drills down to its rows | id, import_id (FK, cascade), order_key, category, severity, severity_rank (int), currency, expected_amount, actual_amount, difference, amount_at_risk, risk_direction, reason, dq_flags (text[]), evidence (jsonb: order rows, payment rows, rule ids, compared values) |
-| `explanations` | LLM output cache | id, import_id (FK, cascade), item_id (FK reconciliation_items, **nullable**: null = whole-run summary), prompt_version, model, output (jsonb), created_at. **`UNIQUE NULLS NOT DISTINCT (import_id, item_id, prompt_version)`** so the run-summary row is also unique; without `NULLS NOT DISTINCT`, Postgres treats NULLs as distinct and would allow duplicate summaries |
+| `orders` | Parsed, de-duplicated, accepted order rows | id, import_id (FK imports, cascade), row_numbers (int[]: all source rows collapsed into this one), order_id_raw, order_key, order_date, customer_email, currency, gross_amount, discount, net_amount, status, raw (jsonb), dq_flags (text[]). **Unique (import_id, order_key)**. Conflicting rows are never inserted here (section 6), so the constraint always holds |
+| `payments` | Parsed, de-duplicated, accepted payment events | id, import_id (FK, cascade), row_numbers, transaction_ref, order_reference_raw, order_key (nullable: blank reference), processed_at, currency, amount, fee, net_settled, type, status, raw (jsonb), dq_flags. **Unique (import_id, transaction_ref)** |
+| `reconciliation_items` | One result per order key, plus one per orphan key and currency. **Includes matched items**, so every headline number drills down to its rows | id, import_id (FK, cascade), item_key (`order:<key>`, `orphan:<key>:<currency>`, or `txn:<transaction_ref>` for a blank reference), order_key (nullable), category, severity, severity_rank (int), currency, expected_amount, actual_amount, difference, reconciled_value, disputed_value, amount_at_risk, risk_direction, reason, dq_flags (text[]), evidence (jsonb: order rows, payment rows, rejected/conflicting row numbers, rule ids, compared values). **Unique (import_id, item_key)**; **unique (id, import_id)**, the target of the composite FK from `explanations` |
+| `explanations` | LLM output cache | id, import_id (FK imports, cascade), item_id (**nullable**: null = whole-run summary), prompt_version, model, output (jsonb), created_at. **Composite FK `(item_id, import_id)` → `reconciliation_items (id, import_id)`**, so an explanation can never point at another import's item; with the default MATCH SIMPLE, a NULL `item_id` (summary) skips the check. **`UNIQUE NULLS NOT DISTINCT (import_id, item_id, prompt_version, model)`**: the run-summary row is also unique (without `NULLS NOT DISTINCT`, Postgres treats NULLs as distinct), and a model change can never serve another model's cached text |
 
 **Indexes** (beyond PKs and the unique constraints above): `imports (user_id, created_at DESC)` for history; `orders (import_id, order_key)`; `payments (import_id, order_key)`; `reconciliation_items (import_id, severity_rank, amount_at_risk DESC)` for the default "look at these first" ordering; `reconciliation_items (import_id, category)` for filters and chart drill-down.
+
+**Integrity constraints** (enforced in the database, not only in code):
+- **Not null:** every required field from section 6, plus `rules_version`, `summary`, `category`, `severity`, `risk_direction`.
+- **Ranges:** `CHECK` that money columns are ≥ 0 (except `difference`, which is signed), and that `amount_at_risk`, `reconciled_value` and `disputed_value` are ≥ 0.
+- **Formats and enums:** `CHECK` that `currency ~ '^[A-Z]{3}$'`, and that `status`, `type`, `category`, `severity` and `risk_direction` are within their allowed sets. These are text with `CHECK` rather than native Postgres enums, so adding a value is a simple migration.
+- **Exclusive buckets:** `CHECK (reconciled_value = 0 OR disputed_value = 0)`, so no item can count in both buckets (section 8).
+- **Email:** `CHECK (email = lower(email))`.
+- **Delete behaviour:** `imports.user_id` uses `ON DELETE RESTRICT` (there is no user deletion in v1); every child FK uses `ON DELETE CASCADE`.
 
 Notes:
 - Child tables carry no `user_id`. Ownership lives in one place (`imports.user_id`), so there is no second copy that could drift out of sync. It is enforced by always going through an owned import.
@@ -91,7 +117,7 @@ Concurrency: if two identical uploads race, the second `INSERT` blocks on the un
 | Upload + reconcile | Same file pair (same bytes, any filenames) → existing import returned; no new rows, no new run | Unique key + `ON CONFLICT DO NOTHING` (above) |
 | Reconciliation | Re-running on the same inputs gives identical classifications and amounts | Pure deterministic engine; tolerances are code constants tied to `RULES_VERSION`, **not** environment variables, so the same version can never behave differently between deployments |
 | Partial failure during import | Parse error, DB error, or crash mid-import → nothing persists | Single transaction around import + rows + results + summary |
-| LLM explain | Repeated or concurrent clicks for the same item → one stored explanation, returned from cache | `UNIQUE NULLS NOT DISTINCT (import_id, item_id, prompt_version)`; insert `ON CONFLICT DO NOTHING`, then read back |
+| LLM explain | Repeated or concurrent clicks for the same item → one stored explanation, returned from cache | `UNIQUE NULLS NOT DISTINCT (import_id, item_id, prompt_version, model)`; insert `ON CONFLICT DO NOTHING`, then read back. Lookup uses the *currently configured* model and prompt version |
 | LLM failure | Timeout, provider error, or invalid output → one retry, then a deterministic fallback | The fallback is returned but **not cached**, so a later click can retry. Reconciliation data is never touched by this path |
 | Frontend double submit | Upload / explain buttons disable while a request is in flight | Client guard; the server-side rules above are the real protection |
 
@@ -131,7 +157,16 @@ A file with headers but zero data rows is valid and produces an explicit "no eli
 
 **Duplicates.** Compared on *parsed* values, so `0` and `0.0` are equal.
 - An exact duplicate order row, or a payment row with the same `transaction_ref`, is collapsed to one record whose `row_numbers` lists every source row. It gets flag `duplicate_row` (ORD-1004).
-- The same `order_id`, or the same `transaction_ref`, with **different** content is an `id_conflict`. The key is not matched; see `NEEDS_REVIEW` below.
+- The same `order_id`, or the same `transaction_ref`, with **different** content is an `id_conflict`.
+  - None of the conflicting rows are inserted. They go into the validation report with their raw values, and the affected order key becomes `NEEDS_REVIEW`.
+  - For a `transaction_ref` conflict, that is the key from the conflicting rows' order reference, if they agree on it.
+
+**Linking rejected rows to order keys.** A rejected row is linked to an order key only when a reliable reference can be extracted. All three conditions must hold:
+1. The row was tokenised into the expected number of columns.
+2. Its key field (`order_id` for orders, `order_reference` for payments) is non-blank after `strip().upper()`.
+3. The rejection reason is in a *different* field (e.g. a malformed amount), not in the key itself.
+
+Only then does the key get a `NEEDS_REVIEW` result. Otherwise the row stays **only** in the import-level validation report and does not affect any item, because guessing a key could attach evidence to the wrong order. A linked key that has no accepted order and no accepted payments still gets one `NEEDS_REVIEW` item, so the problem is visible in the drill-down. The validation report always lists every rejected row, linked or not.
 
 ## 7. Reconciliation engine
 
@@ -142,44 +177,57 @@ A file with headers but zero data rows is valid and produces an explicit "no eli
 3. Per order, from **settled** events in the **order's currency**: `collected = Σ settled charges − Σ settled refunds`.
 4. Expected net cash by order status: `completed` → `net_amount`; `cancelled` → 0; `refunded` → 0 (a charge followed by a full refund).
 5. `difference = collected − expected`.
-6. Payment groups whose key has no order become **one orphan item per unknown order key**, with all of that key's events as evidence.
+6. Payment groups whose key has no order become **one orphan item per unknown order key and currency**, with all of those events as evidence. A payment with a blank order reference becomes its own orphan item, keyed by `transaction_ref`.
 
 Pending and failed events move no money and do not count towards `collected`. A failed attempt followed by a successful charge is normal retry behaviour, not a discrepancy. **Split payments** (several settled charges of different amounts summing to the expected amount) are `MATCHED`. Fees are processor cost: they are validated (2.9% + $0.30 pattern, flag only) but are not part of what the customer owes, so the comparison is order `net_amount` against charge `amount`.
+
+**Refund semantics.**
+- **How refunds attach to orders.** The payments export has no link from a refund to the charge it reverses. Refunds are attributed to an order only through `order_reference` and netted **per order**; they are never paired with individual charges.
+- **What the orders export can express.** It has no refund amount and no "partially refunded" status. An order in status `completed` with an unchanged `net_amount` is the order system asserting that the full net amount was kept.
+- **Partial refund on a completed order** (`REFUND_NOT_IN_ORDERS`). Any settled refund that leaves the order short means the order system overstates that order's revenue by the shortfall. The refund itself is present and settled in the processor. What is missing is its reflection in the order system, which is why this is a reconciliation discrepancy rather than a "missing refund".
+  - The refund may well be legitimate (e.g. a goodwill partial refund), so severity is Medium.
+  - The action is to confirm it was authorised and record it against the order.
+- **Order in status `refunded`.** Expects a full refund (net 0). A smaller settled refund is `REFUND_INCOMPLETE`: the customer may still be owed the balance, or the order status is wrong.
+- **Refund without a matching original charge.** Defined per key, as settled refunds exceeding settled charges (net collected < 0), since refunds are not linked to individual charges.
+  - On an order, of any status, this is `OVER_REFUNDED`. Money left the business beyond what was taken for that order.
+  - On a key with no order, it is an `ORPHAN_PAYMENT` with direction under-collected (money paid out against no order).
+  - A refund in a different currency from the order is caught by `CURRENCY_MISMATCH`.
+- **Pending and failed refunds** move no money. They are listed in the evidence and flagged (`pending_refund`) but do not change `collected`.
 
 ### 7.2 Tolerances (code constants, versioned by `RULES_VERSION`)
 
 | Rule | Value | Reasoning |
 |---|---|---|
-| Amount tolerance | **$0.05 absolute per order**, same currency only, applied to every amount comparison below | Observed noise is ≤ $0.02 (rounding); the smallest real error is $18.50. A percentage tolerance would hide large errors on large orders. Items within tolerance are reported as `WITHIN_TOLERANCE`: counted as reconciled but still visible. |
+| Amount tolerance | **0.05 units of the transaction currency** (5 minor units), absolute per order. It only ever compares amounts within one currency, and applies only to the accepted 2-minor-unit currencies (section 6); a currency with different minor units would need its own value and is rejected at ingestion in v1 | In the sample data, observed noise is ≤ 0.02 USD (rounding) and the smallest real error is 18.50 USD. A percentage tolerance would hide large errors on large orders. Items within tolerance are reported as `WITHIN_TOLERANCE`: counted as reconciled but still visible. |
 | Late charge | A settled charge processed **> 7 days** after the order, or **> 1 h before** it | All normal charges land 1–90 min after the order. Card authorisations typically expire after about 7 days, so a capture weeks later suggests a re-charge or wrong linkage. Refunds are exempt. |
 
-### 7.3 Classification (first matching rule wins; `tol` = 0.05)
+### 7.3 Classification (first matching rule wins; `tol` = 0.05 in the item's currency)
 
 | # | Category | Condition | Severity | Amount at risk | Direction |
 |---|---|---|---|---|---|
-| 0 | `NEEDS_REVIEW` | The key has an `id_conflict`, or a **rejected** row references it | High | 0 (unknown) | Unverified |
+| 0 | `NEEDS_REVIEW` | The key has an `id_conflict`, or a rejected row is **linked** to it under the rule in section 6 | High | 0 (unknown) | Unverified |
 | 1 | `CURRENCY_MISMATCH` | Any settled or pending event currency ≠ order currency | High | Order net | Unverified |
 | 2 | `MISSING_PAYMENT` | expected > 0 and no payment events at all | High | expected | Under-collected |
 | 3 | `PAYMENT_FAILED` | expected > 0, no settled charge, failed charge(s) only | High | expected | Under-collected |
 | 4 | `PAYMENT_PENDING` | No settled charge and a pending charge exists | Low | Pending amount | Under-collected if expected > 0; over-collected if the order is cancelled/refunded (the charge should be voided) |
 | 5 | `CANCELLED_BUT_CHARGED` | Cancelled, `collected > tol` | High | collected | Over-collected |
 | 6 | `REFUND_INCOMPLETE` | Refunded, `collected > tol` | High | collected | Over-collected |
-| 7 | `OVER_REFUNDED` | `collected < −tol` (refunds exceed charges) | High | −collected | Under-collected |
-| 8 | `REFUND_NOT_RECORDED` | Completed, settled refund(s) exist, **and** `difference < −tol` | Medium | −difference | Under-collected (revenue overstated) |
+| 7 | `OVER_REFUNDED` | `collected < −tol` (refunds exceed charges, i.e. a refund without a matching charge) | High | −difference (whole shortfall vs what the order system expects) | Under-collected |
+| 8 | `REFUND_NOT_IN_ORDERS` | Completed, settled refund(s) exist, **and** `difference < −tol` | Medium | −difference | Under-collected (order system overstates revenue) |
 | 9 | `DUPLICATE_CHARGE` | ≥ 2 settled charges each within tol of expected, and `difference > tol` | High | difference | Over-collected |
 | 10 | `OVERCHARGED` | `difference > tol` | High | difference | Over-collected |
 | 11 | `UNDERCHARGED` | `difference < −tol` | Medium | −difference | Under-collected |
-| 12 | `WITHIN_TOLERANCE` | `0 < |difference| ≤ tol` | Info | 0 | — |
+| 12 | `WITHIN_TOLERANCE` | `0 < abs(difference) ≤ tol` | Info | 0 | — |
 | 13 | `LATE_CHARGE` | Amount agrees, timing rule breached | Low | 0 | — |
 | 14 | `MATCHED` | Everything agrees | — | 0 | — |
-| — | `ORPHAN_PAYMENT` | Payment key has no order | Medium | Σ settled charges − Σ settled refunds of the key | Over-collected (unexplained cash) |
+| — | `ORPHAN_PAYMENT` | Payment key has no order (one item per key and currency) | Medium | \|net\| where net = Σ settled charges − Σ settled refunds | Over-collected if net > 0 (unexplained cash); under-collected if net < 0 (refund paid out against no order); none if net = 0 (e.g. pending/failed only) |
 
 Why this order:
 - `NEEDS_REVIEW` is first. If a row about this key was rejected or conflicts, any conclusion would be built on incomplete evidence. Without this rule, a malformed payment row would surface as a false `MISSING_PAYMENT`.
 - A currency mismatch makes every amount comparison meaningless, so it comes before them.
 - Rules 2–3 apply only when money is expected, so a cancelled order with a failed attempt is correctly `MATCHED`.
 - Status-driven rules (5–7) run before the generic amount comparison, so a cancelled-but-charged order is not mislabelled "overcharged".
-- Rule 8 requires the order to actually be short. A refund that *remediates* a duplicate or an overcharge (net collected = expected) is therefore `MATCHED`, not a false "refund not recorded".
+- Rule 8 requires the order to actually be short. A refund that *remediates* a duplicate or an overcharge (net collected = expected) is therefore `MATCHED`, not a false discrepancy.
 - A cancelled or refunded order with net collected within tolerance of 0 is correct and is `MATCHED`.
 
 Secondary signals that don't change the category are attached as `dq_flags` and shown in the drawer: a timing breach when another category won, a pending charge alongside settled ones, a fee mismatch.
@@ -202,11 +250,27 @@ Normalised references, blank optional fields, collapsed duplicate rows, fee/cons
 |---|---|
 | Total orders | Unique order keys (raw row count shown alongside) |
 | Total payments | Payment events (charges / refunds by status) and settled charge value |
-| Value reconciled | Σ order net for `MATCHED`, `WITHIN_TOLERANCE`, `LATE_CHARGE` |
-| Value in dispute | Face value of every other item (order net, or the orphan payment amount) |
-| Money at risk | Σ `amount_at_risk`, split by `risk_direction` into **under-collected** (store is short; pending is shown as a labelled portion of this), **over-collected** (owed to customers or unexplained cash), and **unverified** (currency mismatch / needs review) |
+| Value reconciled | Σ `reconciled_value`, grouped by currency |
+| Value in dispute | Σ `disputed_value`, grouped by currency |
+| Money at risk | Σ `amount_at_risk`, grouped by currency and `risk_direction`: **under-collected** (store is short; pending is shown as a labelled portion of this), **over-collected** (owed to customers or unexplained cash), and **unverified** (currency mismatch). `NEEDS_REVIEW` items have unknown exposure, so they are shown as a **count** next to the unverified amount, not as money |
 
-"In dispute" is how much business is affected. "At risk" is how much money is actually wrong. For example, ORD-1401 is $92.81 in dispute but $25.00 at risk. Every metric is computed from `reconciliation_items`, so clicking it filters the table to exactly the rows behind it.
+**Per-category value formulas.** These are computed by the engine and stored on each item, in the item's currency:
+
+| Category | `reconciled_value` | `disputed_value` |
+|---|---|---|
+| `MATCHED`, `WITHIN_TOLERANCE`, `LATE_CHARGE` | expected (order net for completed orders; 0 for cancelled/refunded orders that correctly net to 0) | 0 |
+| `NEEDS_REVIEW` | 0 | order net if an accepted order exists. Otherwise Σ amounts of the key's accepted settled events (charges + refunds), if they are all in one currency. Otherwise 0 with currency NULL: value unknown, so it is counted only by item count. This is the only case where an item's currency may be NULL, enforced by `CHECK (currency IS NOT NULL OR category = 'NEEDS_REVIEW')` |
+| `CURRENCY_MISMATCH` | 0 | order net, in the **order's** currency. The payment amounts are in another currency, so they appear in the evidence only and are never added to any total |
+| `ORPHAN_PAYMENT` | 0 | Σ settled charge amounts + Σ settled refund amounts for that key and currency: the gross money that moved with no order behind it |
+| every other order category | 0 | order net |
+
+**No double counting:**
+- Each accepted order belongs to exactly one item, and each accepted payment event to exactly one item (its order's item, its orphan item, or its own blank-reference item). The engine asserts this, and a test checks it.
+- Each item has one category and one `risk_direction`.
+- `reconciled_value` and `disputed_value` are mutually exclusive (database `CHECK`).
+- Totals are plain sums over items grouped by currency; payments counts come from the `payments` table, not from items.
+
+"In dispute" is how much business is affected. "At risk" is how much money is actually wrong. For example, ORD-1401 is 92.81 USD in dispute but 25.00 USD at risk. Every metric is a sum over `reconciliation_items`, so clicking it filters the table to exactly the rows behind it.
 
 ## 9. LLM explanations
 
@@ -220,7 +284,7 @@ Normalised references, blank optional fields, collapsed duplicate rows, fee/cons
   - **Where consistency comes from instead:** the JSON schema; low `thinking_level` (the task is summarising given facts, not open reasoning, so this also cuts latency and cost); a capped output length; and the **cache**, which makes each item's explanation generated once and then stable for every viewer.
   - If an older non-reasoning model is configured instead, a low temperature (≈ 0.2) is the right choice for that model. The setting lives next to the model choice for that reason.
 - **Bad responses:** a provider error, timeout, non-JSON output, or schema violation (validated with Pydantic) leads to one retry. If that also fails, the API returns a **deterministic template explanation** built from the evidence, marked `source: "fallback"`. The UI shows which source produced the text. The reconciliation result never depends on the LLM.
-- **Cache key:** import + item + prompt version. Changing the model or prompt bumps `PROMPT_VERSION`.
+- **Cache key:** import + item + prompt version + **model id**. The configured model is part of the key itself, so changing `GEMINI_MODEL` can never serve another model's cached text, even if nobody bumps `PROMPT_VERSION`. Changing the prompt still requires bumping `PROMPT_VERSION`. Older cached rows stay as history and are not shown.
 
 ## 10. Deliberate cuts (and how to add them back)
 
@@ -230,7 +294,7 @@ Normalised references, blank optional fields, collapsed duplicate rows, fee/cons
 | Object storage for files | Files are KB-sized and stored in Postgres with a hash, in the same transaction | S3 with private keys + signed URLs |
 | Background queue | Synchronous processing finishes in milliseconds | Worker + job table; the job carries ids and re-checks ownership |
 | Refresh tokens, revocation, password reset | Out of scope for 24 h | Rotating refresh token + server-side session table, email reset flow |
-| Login rate limiting | bcrypt cost slows brute force; proper limiting needs trusted client IPs behind the proxy | Per-account + per-IP limiter (Redis) |
+| Shared rate limiting | v1 ships an in-memory limiter (section 4), which is correct for one API instance | Move the counters to Redis when running more than one instance |
 | Postgres row-level security | One enforced query path + tests | RLS as defence in depth |
 | FX conversion | No agreed rate source | Rates table with source and timestamp |
 
@@ -272,6 +336,7 @@ All non-2xx responses use the error shape from section 5a. Unauthenticated reque
   - over-collected $936.58
   - unverified USD 210.00 + EUR 145.00
   - reconciled $39,963.28 across 168 orders
+  - in dispute 2,469.37 USD + 145.00 EUR
 
   Plus the row-shuffle determinism test, and unit tests for:
   - tolerance edges (0.05 → within, 0.06 → mismatch)
@@ -283,7 +348,11 @@ All non-2xx responses use the error shape from section 5a. Unauthenticated reque
   - refunded with no events → matched
   - refunds exceeding charges → over-refunded
   - completed with partial refund → refund not recorded
-  - a rejected payment row referencing an order → needs review (not missing payment)
+  - a rejected payment row with a readable order reference → that order becomes needs review (not missing payment)
+  - a rejected row with a blank or unreadable key → validation report only; no item is affected
+  - refund-only order → over-refunded with the whole shortfall at risk
+  - refund-only orphan → orphan, under-collected
+  - every accepted order and payment belongs to exactly one item
   - currency mismatch never summed across currencies
 - **Ingestion:**
   - DD/MM date parsing and blank timestamps
@@ -300,12 +369,18 @@ All non-2xx responses use the error shape from section 5a. Unauthenticated reque
   - password > 72 bytes → 422
   - unauthenticated → 401 and cookie flags set
   - POST with a foreign `Origin` → 403
+  - POST with no `Origin` but a matching `Referer` → allowed
+  - POST with neither header → 403
+  - 6th failed login for one email within 15 min → 429 with `Retry-After`
+  - explain beyond the per-user limit → 429
   - cross-user list/read/explain → 404
   - same file pair uploaded twice (sequentially and concurrently) → one import
   - import failure mid-write → no partial rows
   - explain twice → one cached row, including the run summary
+  - changing the configured model → a new explanation, not the old model's cached one
+  - an explanation pointing at another import's item is rejected by the composite FK
   - LLM timeout / malformed JSON / schema violation → fallback, not cached
-- The sample CSVs are committed under `backend/tests/fixtures/` as test fixtures.
+- The sample CSVs **will be added** under `backend/tests/fixtures/` together with the engine tests. As of this design revision they are **not** in the repository.
 
 ## 14. Configuration (`.env.example`, no real values)
 
@@ -314,7 +389,7 @@ All non-2xx responses use the error shape from section 5a. Unauthenticated reque
 | `DATABASE_URL` | API, migrations | Postgres connection string. Use Neon's **direct (non-pooled)** endpoint: transaction-mode poolers break prepared statements, and the single API instance holds a small pool itself |
 | `JWT_SECRET` | API | ≥ 32 random bytes |
 | `COOKIE_SECURE` | API | `true` in production, `false` only for local HTTP |
-| `APP_ORIGIN` | API | Allowed `Origin` for state-changing requests |
+| `APP_ORIGINS` | API | Comma-separated exact origins allowed for `POST` requests (e.g. the production web URL; add `http://localhost:3000` locally) |
 | `GEMINI_API_KEY` | API | LLM key (backend only) |
 | `GEMINI_MODEL` | API | Model id |
 | `API_BASE_URL` | Web (server-side) | Target of the `/api/*` rewrite |

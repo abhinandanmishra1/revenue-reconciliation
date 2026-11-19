@@ -1,8 +1,8 @@
 # Revenue Reconciliation Dashboard
 
-A multi-tenant application for importing order and payment data, reconciling financial records, investigating discrepancies, and understanding settlement outcomes.
+A per-user workspace for importing order and payment data, reconciling financial records, investigating discrepancies, and understanding settlement outcomes. Each user's imports and results are private to that user; there are no shared or organisation workspaces in v1.
 
-The product is designed around a simple principle: **reconciliation decisions must be deterministic, explainable, reproducible, and isolated per customer**. AI may help explain a result, but it never decides whether two financial records match.
+The product is designed around a simple principle: **reconciliation decisions must be deterministic, explainable, reproducible, and isolated per user**. AI may help explain a result, but it never decides whether two financial records match.
 
 > Project status: design agreed (see `design.md`), implementation in progress.
 
@@ -92,4 +92,4 @@ Design agreed; implementation in progress.
 
 ## Working agreement
 
-Discuss requirements, edge cases, architecture, and data contracts before implementation. The two sample CSVs are committed only as test fixtures under `backend/tests/fixtures/`.
+Discuss requirements, edge cases, architecture, and data contracts before implementation. The two sample CSVs will be added only as test fixtures under `backend/tests/fixtures/` when the engine tests are written; they are not in the repository yet.
