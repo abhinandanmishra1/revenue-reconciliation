@@ -1,85 +1,168 @@
 # Revenue Reconciliation Dashboard
 
-A per-user workspace for importing order and payment data, reconciling financial records, investigating discrepancies, and understanding settlement outcomes. Each user's imports and results are private to that user; there are no shared or organisation workspaces.
+Upload an orders export and a payment-processor export, and see on one dashboard how much revenue reconciles, how much is in dispute, how much money is at risk, and which orders to look at first. Every result carries its evidence, down to the source row numbers. An LLM can explain a result in plain language, but it never decides one.
 
-The product is designed around a simple principle: **reconciliation decisions must be deterministic, explainable, reproducible, and isolated per user**. AI may help explain a result, but it never decides whether two financial records match.
+- **Live app:** _add the Vercel URL after deployment_
+- **Demo login:** _add the demo account after creating it on the live site_
+- **Design:** [`design.md`](design.md) is the source of truth for the data model, rules, metrics, security and API.
+- **Deployment:** [`docs/deployment.md`](docs/deployment.md)
 
-## Problem
+## Local setup
 
-Businesses often maintain order records in one system and payment processor records in another. The two sources may differ in identifiers, timestamps, statuses, currencies, fees, refunds, and settlement timing. Manually comparing exports is slow and makes it difficult to identify missing payments, duplicate transactions, amount differences, pending/failed payments, or refunds.
+### Everything at once (Docker)
 
-This application provides a repeatable workflow to:
+```bash
+cp .env.example .env        # set JWT_SECRET; GEMINI_* are optional
+docker compose up --build
+```
 
-1. Upload an orders CSV and a payments CSV.
-2. Validate each file and report row-level data-quality issues.
-3. Normalize source fields without losing the original values.
-4. Reconcile records using explicit, deterministic rules.
-5. Classify matched records and discrepancies with evidence.
-6. Explore totals and exceptions in a dashboard.
-7. Request an AI-generated explanation of an already-computed result.
+Open http://localhost:3000, sign up, and upload the two CSVs (sample files go in `backend/tests/fixtures/`). Without a Gemini key, "Explain with AI" returns the deterministic fallback.
 
-## Product boundaries
+### Without Docker
 
-### In scope
+Requirements: Python 3.12+, [uv](https://docs.astral.sh/uv/), Node 22, and Postgres 15+.
 
-- Email + password accounts; each user sees only their own data.
-- Uploading an orders CSV and a payments CSV together as one import.
-- Validation reports with row-level reasons, and import history.
-- Parsing and normalizing source records while preserving raw values and the original files.
-- Reproducible reconciliation: each import records its file hashes and rules version.
-- Deterministic matching and discrepancy classification with stored evidence.
-- Currency-aware dashboard summaries, a priority-ordered and searchable discrepancy table, and drill-down to source rows.
-- AI explanations of individual discrepancies and of a whole import, with a deterministic fallback.
+```bash
+cd backend
+cp .env.example .env        # point DATABASE_URL at your Postgres
+uv sync
+uv run alembic upgrade head
+uv run uvicorn app.main:app --reload --port 8000
+```
 
-### Out of scope for the initial version
+```bash
+cd frontend
+cp .env.example .env.local  # API_BASE_URL=http://localhost:8000
+npm install
+npm run dev
+```
 
-- Initiating payments, refunds, payouts, or bank transfers.
-- Automatically changing source-system records.
-- Organisations, shared workspaces, and roles.
-- FX conversion between currencies.
-- LLM-driven matching or mutation of financial records.
-- Complex accounting, tax, or general-ledger functionality.
+### Tests
 
-## Core principles
+```bash
+cd backend
+uv run pytest               # needs Postgres; set TEST_DATABASE_URL to override the default
+```
 
-1. **Data isolation:** every import belongs to one user; all data is reached only through an import owned by the requesting user.
-2. **Traceability:** original uploads and raw field values remain available for audit and investigation.
-3. **Determinism:** the reconciliation engine uses explicit rules and produces the same result for the same inputs and rules version, regardless of row order.
-4. **Currency safety:** amounts are never aggregated across currencies.
-5. **Idempotency:** repeating a request (signup, upload, explain) never repeats its side effects; a failed request leaves no partial state.
-6. **Explainable AI:** AI can summarize evidence already computed by the system; it cannot invent evidence or decide financial outcomes.
-7. **Incremental delivery:** a modular monolith, extended only when real constraints require it.
+The tests cover the engine (golden fixtures, row-shuffle determinism, every rule and refund boundary), ingestion, auth and CSRF, rate limits, idempotent and concurrent uploads, rollback on failure, user isolation, and the LLM adapter against a mocked provider.
 
-## Technology
+## Architecture
 
-| Layer | Choice |
+```
+Browser ──► Next.js (Vercel)  /api/* rewrite, same origin
+               ▼
+            FastAPI (Railway)
+               ├─ auth        bcrypt, JWT in an httpOnly cookie, Origin check, rate limits
+               ├─ ingestion   CSV → typed records + validation report        (pure)
+               ├─ reconcile   records → classified items + metrics           (pure)
+               ├─ imports     one-transaction write path, dashboard queries
+               └─ explain     Gemini adapter, schema validation, cache, fallback
+               ▼
+            PostgreSQL (Neon)
+```
+
+| Path | What lives there |
 |---|---|
-| Web application | Next.js, React, TypeScript |
-| UI | Tailwind CSS and shadcn/ui |
-| Charts / tables | Recharts, TanStack Table |
-| Authentication | Own: bcrypt password hashing, JWT in an httpOnly cookie |
-| API | Python and FastAPI |
-| Database | PostgreSQL |
-| ORM and migrations | SQLAlchemy 2.x and Alembic |
-| Validation | Pydantic |
-| AI explanations | Gemini API (backend only, structured output, deterministic fallback) |
-| Frontend hosting | Vercel |
-| API hosting | Railway |
-| Database hosting | Neon |
-| Testing | Pytest |
+| `backend/app/ingestion/` | File checks, field parsing, normalisation, duplicates vs id conflicts, rejected-row linking |
+| `backend/app/reconcile/` | `rules.py` (versioned constants), `engine.py` (classification), `metrics.py` (per-currency sums) |
+| `backend/app/services/imports.py` | Hash → parse → reconcile in memory → `INSERT … ON CONFLICT DO NOTHING` → children → `COMMIT` |
+| `backend/app/security/` | Password hashing, JWT, client IP, rate limiter, Origin/Referer middleware |
+| `backend/app/explain/` | Prompts, output schemas, REST adapter, retry and fallback, cache |
+| `backend/alembic/` | Schema migration with every constraint and index from design.md section 4 |
+| `frontend/src/app/` | Login, signup, imports, dashboard routes; `middleware.ts` redirects when there is no session |
+| `frontend/src/components/dashboard/` | KPI row, risk chart, results table (TanStack Table), evidence drawer, explain panel |
 
-The design document records the rationale for each choice and what was deliberately left out.
+Key choices:
+- **Pure core.** Parsing and reconciliation are functions with no database, HTTP, clock or randomness, so they are tested directly.
+- **Same-origin proxy.** The session cookie stays first-party, and no CORS configuration is needed.
+- **Ownership lives only on `imports.user_id`.** Every query goes through `WHERE id = :id AND user_id = :me`, so another user's data returns 404.
+- **Synchronous processing.** Files are capped at 2 MB, and a few thousand rows reconcile in milliseconds, so there is no job queue.
 
-## High-level workflow
+## Reconciliation logic
 
-1. A user signs up or logs in and receives an httpOnly session cookie.
-2. The user uploads the orders file and the payments file together.
-3. The API validates and parses both files in memory, then reconciles them with the deterministic engine.
-4. In one transaction, it stores the import (original files, hashes, rules version), the parsed rows, every reconciliation result, and the summary. Uploading the same file pair again returns the existing import.
-5. The dashboard shows headline figures by currency, a breakdown by discrepancy type, and a priority-ordered table that drills down to source rows.
-6. On request, the API asks the LLM to explain a result or the whole import from the stored evidence, with a deterministic fallback if the LLM fails.
+**Matching.** `order_id` and `order_reference` are trimmed and upper-cased, then matched. They are the only identifier the two files share. For each order, using settled events in the order's currency:
 
-## Repository guide
+```
+collected  = Σ settled charges − Σ settled refunds
+expected   = net_amount if completed, else 0     (cancelled / refunded orders should keep nothing)
+difference = collected − expected
+```
 
-- `README.md` — product overview, scope, principles, stack, and workflow.
-- `design.md` — goal, architecture, key decisions, data model, ingestion, reconciliation rules, metrics, security, LLM approach, API, UI, testing, and configuration.
+Pending and failed events move no money, so they don't count towards `collected`, but they appear as evidence. The order's `net_amount` is compared with the charged `amount`, not `net_settled`, because processor fees are the store's cost, not the customer's error.
+
+**Types.** These are checked in order and the first match wins:
+
+| # | Category | When |
+|---|---|---|
+| 0 | Needs review | An id conflict, or a rejected row that names this order. No conclusion is drawn from incomplete evidence |
+| 1 | Currency mismatch | A settled or pending event is in another currency. Amounts can't be compared |
+| 2–4 | Missing / failed / pending payment | Nothing has settled yet |
+| 5–6 | Cancelled but charged, refund incomplete | The order's status says the store should keep nothing |
+| 7–8 | Over-refunded, refund not in orders | Refunds that the order record doesn't reflect |
+| 9–11 | Duplicate charge, overcharged, undercharged | Generic amount rules, checked after the status rules |
+| 12–14 | Within tolerance, late charge, matched | Reconciled |
+| — | Orphan payment | A payment whose key has no order |
+
+Each type has a fixed severity: customer harm first, then revenue leakage, then hygiene. The table is sorted by severity, then amount at risk, then order key.
+
+**Tolerances, and why:**
+- **0.05, absolute, in the transaction's currency.** Rounding noise in the sample files is ≤ 0.02 and the smallest real error is 18.50. A percentage tolerance would hide large errors on large orders. Items within tolerance stay visible.
+- **Timing.** A settled charge more than 7 days after the order, or more than 1 hour before it, breaks the timing rule. Normal charges land 1–90 minutes after the order, and card authorisations typically expire after about 7 days. Refunds are exempt.
+- **Versioned.** Both values are code constants under `RULES_VERSION`, not environment variables, so a stored import can always be reproduced.
+
+**Amounts.** All money is `Decimal` / `NUMERIC(14,2)`. Amounts are never summed across currencies. Each item counts either as reconciled or as in dispute, never both (a database `CHECK` enforces this). Money at risk is split by direction: under-collected, over-collected, or unverified.
+
+## What we found in the sample data
+
+These totals come from the sample exports and are pinned in the golden test (`backend/tests/test_engine_golden.py`):
+
+| | USD | EUR |
+|---|---|---|
+| Reconciled | 39,963.28 across 168 orders | — |
+| In dispute | 2,469.37 | 145.00 |
+| Under-collected (store is short) | 886.85 | — |
+| Over-collected (owed to customers or unexplained cash) | 936.58 | — |
+| Unverified (currency mismatch) | 210.00 | 145.00 |
+
+What this means for the business:
+- **Most revenue reconciles.** About 94% of USD order value (39,963.28 of 42,432.65) matches what was collected.
+- **About 937 USD may be owed back to customers.** This comes from duplicate charges, overcharges, and cancelled or refunded orders that still hold money. It goes first: it is customer harm and a chargeback risk.
+- **About 887 USD has not been collected,** from missing, failed or pending payments, refunds the order system doesn't show, and undercharges. Part of it is pending and may settle without action.
+- **210.00 USD and 145.00 EUR can't be checked,** because the order and the payment are in different currencies. Someone needs to confirm which currency the customer actually paid in. The app does not do FX conversion, by design.
+- **Data quality:** malformed rows are rejected rather than guessed. When a rejected row can be tied to an order, that order is marked Needs review instead of being reported as a false "missing payment".
+
+_The per-category breakdown is printed by `cd backend && uv run python scripts/classify.py`; add its highlights here._
+
+## LLM approach
+
+- **What it does:** explains one result, or summarises a whole import. It never changes a category or an amount.
+- **Prompting:**
+  - A short system instruction: explain only what the evidence supports, use plain business language, quote currencies, and lower the confidence when unsure.
+  - The evidence is a compact JSON object: category, rule, amounts, statuses, events and timestamps. It goes inside a `<data>` block that the model is told to treat as untrusted data, because CSV values could contain injected instructions.
+  - No personal data is sent: no customer emails and no raw rows.
+  - The summary sends the metrics plus the top 20 items.
+- **Structured output:** the request asks for `application/json` with a JSON Schema. Every reply is validated with Pydantic: required fields, 1–4 actions, capped lengths, `extra="forbid"`. The UI renders it as plain text.
+- **Temperature:**
+  - Gemini 3 models keep the default 1.0, which Google recommends for them because lower values can cause looping, and use a low thinking level.
+  - Any other model id gets 0.2.
+  - Consistency comes from the schema, the capped output and the cache rather than from temperature.
+- **Bad responses:** a timeout, provider error, invalid JSON or schema violation triggers **one retry**, with both attempts sharing a budget of under 25 s. If both fail, the user gets a **deterministic template** built from the evidence, labelled "rule-based". This fallback is **not cached**, so a later click can try the LLM again.
+- **Cache:** one row per import + item + prompt version + model. `UNIQUE NULLS NOT DISTINCT` keeps a single whole-import summary row. Changing the model or the prompt never serves stale text, and repeated or concurrent clicks store one row.
+- **Cost control:** 10 explain requests per user per minute.
+
+## What I'd build next
+
+- Shared rate-limit counters in Redis, so the API can run more than one instance.
+- Background processing with a job table for files larger than a few MB, plus object storage for the originals.
+- Teams: organisations and memberships, with imports scoped by tenant, and Postgres row-level security as defence in depth.
+- Session revocation, refresh tokens and password reset.
+- A way to resolve an item (mark it as investigated, with a note) and export the exception list.
+- FX conversion once there is a trusted rate source, so currency mismatches can be checked.
+
+## How AI tools were used
+
+- **The design came first.** I wrote `design.md` before any code: the rules, metrics, constraints and failure handling.
+- **Claude Code as a pair programmer.** It scaffolded the project and implemented each phase on its own branch in small commits. I reviewed every pull request before merging.
+- **Ambiguities went back to me.** Where the design was ambiguous, the AI raised it instead of guessing, and the agreed clarifications were recorded in `design.md` in the same pull request.
+- **Tests decide.** The fixture totals, the refund boundary table and the idempotency and isolation tests are the acceptance criteria. A change ships only when they pass.
+- **No AI in the core.** AI never makes reconciliation decisions in the product. The engine is deterministic and the LLM only explains its output.
