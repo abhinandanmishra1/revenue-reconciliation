@@ -73,8 +73,9 @@ Browser ──► Next.js (Vercel)
 | `imports` unique `(user_id, orders_sha256, payments_sha256, rules_version)` | Re-uploading the same files returns the existing import |
 | `orders` unique `(import_id, order_key)`; `payments` unique `(import_id, transaction_ref)`; `reconciliation_items` unique `(import_id, item_key)` | One row per business key in each import |
 | `explanations` composite FK `(item_id, import_id)` → `reconciliation_items (id, import_id)` | An explanation can only reference an item from its own import. A NULL `item_id` (summary) skips the check |
+| `reconciliation_items` unique `(id, import_id)` | Target of the composite FK above |
 | `explanations` `UNIQUE NULLS NOT DISTINCT (import_id, item_id, prompt_version, model)` | One cached explanation per item, prompt version and model. Plain `UNIQUE` would treat NULL summary rows as distinct |
-| `CHECK`: money ≥ 0 (except the signed `difference`); 3-letter currency; status, type, category, severity and direction within allowed sets; `email = lower(email)` | Invalid states cannot be stored |
+| `CHECK`: money ≥ 0 (except the signed `difference` and `actual_amount`, because collected cash is negative when refunds exceed charges); 3-letter currency; status, type, category, severity and direction within allowed sets; `email = lower(email)` | Invalid states cannot be stored |
 | `CHECK (reconciled_value = 0 OR disputed_value = 0)` | An item counts in exactly one bucket |
 | `CHECK (currency IS NOT NULL OR category = 'NEEDS_REVIEW')` | Currency may be unknown only when the evidence is incomplete |
 | Child FKs `ON DELETE CASCADE`; `imports.user_id` `ON DELETE RESTRICT` | Deleting an import removes everything that belongs to it |
@@ -193,6 +194,14 @@ First matching rule wins. `tol` is 0.05 in the item's currency.
 - Missing/failed rules apply only when money is expected, so a cancelled order with a failed attempt is correctly `MATCHED`.
 - Status rules come before the generic amount rules, so a cancelled-but-charged order is not called "overcharged".
 
+**Clarifications used by the implementation:**
+- `PAYMENT_FAILED` requires every same-currency charge attempt to have failed; failed plus pending is `PAYMENT_PENDING`.
+- Rules 2–4 look at events in the order's currency. A failed event in another currency is evidence only.
+- Timing limits are strict: exactly 7 days after, or exactly 1 h before, is still on time.
+- An orphan whose settled events net to 0 has 0 at risk and no direction.
+- A payment `transaction_ref` conflict marks every non-blank order key it references as `NEEDS_REVIEW`. If all its references are blank, it becomes one `NEEDS_REVIEW` item keyed by the transaction ref.
+- `transaction_ref` is normalised like other identifiers (`strip().upper()`); the raw value stays in `raw`.
+
 Signals that don't change the category are attached as `dq_flags`: a timing breach when another category won, a pending charge next to settled ones, a fee mismatch.
 
 **Severity** follows the order of action: customer harm first (wrong charges, refunds owed), then revenue leakage, then hygiene. The default sort is severity, then amount at risk descending, then order key.
@@ -305,7 +314,7 @@ Errors use one shape, `{ "error": { "code", "message", "details"? } }`, with no 
 | POST | `/api/imports` | Upload `orders` + `payments` (multipart), validate, reconcile | 201, 200 (`already_imported`), 413, 422 |
 | GET | `/api/imports` | Import history, newest first | 200 |
 | GET | `/api/imports/{id}` | Metrics and validation report | 200, 404 |
-| GET | `/api/imports/{id}/items` | Results. Filters: `category`, `severity`, `direction`, `currency`, `has_dq`; search `q` (order id, transaction ref, email); sort; pagination. Defaults to non-matched items by priority | 200, 404 |
+| GET | `/api/imports/{id}/items` | Results. Filters: `category`, `severity`, `direction`, `currency`, `has_dq`; search `q` (order id, transaction ref, email); sort; pagination. Defaults to every category except `MATCHED`, by priority | 200, 404 |
 | GET | `/api/imports/{id}/items/{item_id}` | Evidence plus any cached explanation | 200, 404 |
 | POST | `/api/imports/{id}/items/{item_id}/explain` | Explain one result | 200, 404, 429 |
 | POST | `/api/imports/{id}/summary/explain` | Summarise the import | 200, 404, 429 |
@@ -377,7 +386,7 @@ Every route except signup, login and health requires a session (`401` otherwise)
 
 | Variable | Used by | Purpose |
 |---|---|---|
-| `DATABASE_URL` | API, migrations | Postgres connection string. Use Neon's direct (non-pooled) endpoint, because transaction-mode poolers break prepared statements |
+| `DATABASE_URL` | API, migrations | Postgres 15+ connection string (`UNIQUE NULLS NOT DISTINCT`). Use Neon's direct (non-pooled) endpoint, because transaction-mode poolers break prepared statements |
 | `JWT_SECRET` | API | ≥ 32 random bytes |
 | `COOKIE_SECURE` | API | `true` in production, `false` only for local HTTP |
 | `APP_ORIGINS` | API | Comma-separated origins allowed for `POST` |
