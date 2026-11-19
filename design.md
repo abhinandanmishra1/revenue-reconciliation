@@ -1,301 +1,239 @@
-# Design Notes — Revenue Reconciliation Dashboard
+# Design — Revenue Reconciliation Dashboard
 
-> Status: proposed design for review. This document captures the current architecture direction and the decisions that must be confirmed before implementation.
+> Status: **agreed design** (v1). This replaces the earlier proposal. The earlier draft targeted a multi-tenant SaaS; this version is scoped to what the product needs now, with each cut recorded in section 10 together with the path to add it back.
 
-## 1. Goals and principles
+## 1. Goals
 
-- Import orders and payment events from customer-provided CSV files.
-- Reconcile records using deterministic, explainable rules.
-- Support multiple customers with strict tenant isolation.
-- Preserve original files, source values, and processing history.
-- Make reconciliation runs reproducible using fixed inputs and a rules version.
-- Use AI only to explain already-computed evidence; AI must not make matching or financial decisions.
-- Use exact decimal or integer-minor-unit arithmetic. Never use binary floating point for money.
-- Keep currencies separate unless an explicit FX policy is agreed.
-- Start with a modular monolith rather than premature microservices.
+- Let a signed-in user upload an orders export and a payment-processor export, reconcile them, and see where money is leaking.
+- Reconciliation is **deterministic and repeatable**: the same input files and rules version always produce the same result, regardless of row order.
+- Every discrepancy carries **evidence** (source rows, compared values, rule applied) so a reviewer can reach the same conclusion without AI.
+- An LLM **explains** results in plain language. It never decides whether records match.
+- Money is handled with `Decimal` / `NUMERIC(14,2)`, never floats. Amounts in different currencies are never added together.
 
-## 2. Where uploaded CSVs and their rows live
+## 2. Architecture
 
-Use both private object storage and relational tables, for different purposes.
+```
+Browser ──► Next.js (Vercel)
+              │  /api/*  rewrite (same origin → httpOnly cookie, no CORS)
+              ▼
+           FastAPI (Railway)
+              ├─ auth        : signup / login / logout / me (bcrypt + JWT cookie)
+              ├─ ingestion   : CSV validation, parsing, normalisation
+              ├─ reconcile   : pure deterministic engine (no I/O)
+              ├─ dashboard   : summary + filterable discrepancy queries
+              └─ explain     : LLM adapter (Gemini) with schema validation + fallback
+              ▼
+           PostgreSQL (Neon)
+```
 
-### Original files: private object storage
+- **Modular monolith.** The reconciliation engine is a pure function, `(orders, payments, rules) -> result`, with no database or HTTP dependency, so it is unit-tested directly.
+- **Same-origin proxy.** Next.js rewrites `/api/*` to the FastAPI service. The browser only ever talks to one origin. This lets the session live in an `httpOnly; Secure; SameSite=Lax` cookie (not readable by JavaScript, so not stealable by XSS), and no CORS configuration is needed.
+- **Synchronous processing.** Ingest + reconcile of a few thousand rows takes milliseconds. Upload size is capped (5 MB per file). A queue is noted as future work.
 
-Store every uploaded CSV as an immutable object under a backend-generated key, for example:
+## 3. Stack
 
-    tenants/{tenant_id}/uploads/{upload_id}/source.csv
-
-The database stores metadata and the storage key, not the file bytes. Metadata should include upload ID, tenant ID, uploader, dataset type (orders/payments), original filename, storage key, content hash, byte size, content type, upload time, processing status, and validation summary.
-
-Keep the bucket private. A download must be authorized by the API before it issues a short-lived signed URL or streams the file. A storage key is not authorization. Apply file-size limits, safe filename handling, encryption, and a retention policy.
-
-### Parsed rows: shared relational tables
-
-Do not create a physical table for every customer. Use shared tables with explicit tenant and upload ownership columns. For example:
-
-    tenants
-      └── uploads
-            ├── order_records
-            └── payment_records
-      └── reconciliation_runs
-            └── reconciliation_items
-
-Every imported row carries tenant_id and upload_id. All repository/service operations require a verified tenant context and filter by it. Use composite foreign keys where practical so a row cannot accidentally reference another tenant's upload.
-
-A shared-schema model keeps migrations and reporting manageable. Per-customer tables make migrations, indexing, ORM mapping, and analytics harder and do not automatically guarantee isolation.
-
-### Why not reconcile directly from CSV every time?
-
-Repeated parsing wastes work. Search, filtering, pagination, dashboard aggregation, run history, audit evidence, and reprocessing become awkward. Persist normalized rows once, then reconcile database records associated with the selected uploads. Keep the original file as immutable source evidence.
-
-## 3. Proposed architecture
-
-    Browser / Next.js
-       | authenticated access token
-       v
-    FastAPI API
-       | verify signature, issuer, audience, expiry and claims
-       v
-    Verified user + tenant context
-       |
-       +--> Upload / ingestion service --> private object storage
-       |              |
-       |              +--> parse, validate, normalize --> PostgreSQL
-       |
-       +--> Reconciliation service --> deterministic rules --> PostgreSQL
-       |
-       +--> Dashboard query service -----------------------> PostgreSQL
-       |
-       +--> Explanation service --> minimal evidence --> Gemini API
-
-### Request path
-
-1. The user signs in through the identity provider.
-2. The frontend sends an access token to FastAPI.
-3. FastAPI independently validates the token using the provider's supported mechanism.
-4. FastAPI resolves the internal user and tenant membership from trusted identity claims and database records.
-5. Authorization dependencies create a verified tenant context.
-6. Every domain service receives that context. A client-supplied tenant ID is never proof of access.
-7. The service performs a tenant-scoped operation and returns only authorized data.
-
-### Backend modules
-
-- Identity and access: token verification, user mapping, tenant membership, authorization.
-- Ingestion: upload metadata, object storage adapter, CSV parsing, validation, normalization, import lifecycle.
-- Reconciliation: run orchestration, matching strategies, classification, financial calculations, evidence generation.
-- Dashboard/read models: tenant-scoped aggregates, filters, pagination, detail views.
-- Explanation: provider adapter, prompt construction, output validation, rate limits, safe fallback.
-- Persistence: SQLAlchemy models, repositories, transaction boundaries, migrations.
-
-Keep domain rules independent of FastAPI route handlers and external providers so they can be unit-tested directly.
-
-## 4. Authentication and tenant authorization
-
-Authentication establishes who the user is. Authorization establishes which tenant and resources the user may access.
-
-### Frontend
-
-- Use the identity provider's supported sign-in/session integration.
-- Attach the access token to API requests using the documented scheme.
-- Handle expired sessions through the provider SDK.
-- Never expose provider secret keys in browser code.
-
-### Backend
-
-- Verify token signature and allowed signing algorithm.
-- Verify issuer and audience according to the selected token contract.
-- Verify expiry and not-before claims.
-- Validate the required subject/identity claims.
-- Resolve the internal user and active tenant membership server-side.
-- Reject missing, invalid, expired, or unauthorized identities.
-
-A request body containing tenant_id must not grant access to that tenant. If a user belongs to multiple tenants, tenant switching must be an explicit authorized operation and membership must be checked server-side.
-
-Use tenant_id on tenant-owned tables, tenant-required repository methods, composite foreign keys where practical, and optionally PostgreSQL row-level security after connection-pooling behavior is tested. Add negative tests proving one tenant cannot read or mutate another tenant's uploads, rows, runs, or results.
-
-Clerk is the current managed-auth proposal. Confirm the exact token type, issuer/audience rules, and verification implementation against the chosen Clerk integration before coding; do not assume all Clerk tokens are interchangeable.
-
-## 5. Data model proposal
-
-The following is conceptual. Exact fields and constraints depend on the source brief and agreed CSV contract.
-
-| Table | Main purpose | Important fields |
+| Layer | Choice | Why |
 |---|---|---|
-| tenants | Customer workspace | id, name, created_at |
-| users | Internal identity | id, identity_provider_subject, email |
-| tenant_memberships | User access to tenant | tenant_id, user_id, role |
-| uploads | Source file and processing lifecycle | id, tenant_id, uploader, source_type, storage_key, sha256, status, row counts |
-| order_records | Parsed order rows | id, tenant_id, upload_id, source_row_number, raw_record, raw_order_id, normalized_order_id, dates, currency, amounts, status |
-| payment_records | Parsed payment events | id, tenant_id, upload_id, source_row_number, raw_record, raw references, normalized reference, processed_at, currency, amount, fee, net_settled, type, status |
-| reconciliation_runs | Immutable execution record | id, tenant_id, orders_upload_id, payments_upload_id, rules_version, status, timestamps |
-| reconciliation_items | Result and evidence | run_id, classification, linked source records, compared values, difference, reason codes |
-| audit_events | Important user/system activity | tenant_id, actor, action, resource, timestamp |
+| Frontend | Next.js (App Router), TypeScript, Tailwind, shadcn/ui | Accessible components, fast to build a clean UI |
+| Charts / table | Recharts, TanStack Table | Recharts underpins shadcn charts; TanStack handles filtering and sorting |
+| API | FastAPI, Pydantic | Typed request/response contracts, Decimal support |
+| ORM / migrations | SQLAlchemy 2.x, Alembic | Explicit schema, reviewable migrations |
+| Database | PostgreSQL on Neon | Real relational DB, NUMERIC money, free managed tier |
+| Auth | Own: bcrypt password hashing + JWT (HS256) in httpOnly cookie | Small, auditable, no third-party signup friction |
+| LLM | Google Gemini API, called from the backend only | Brief allows any provider; JSON-schema structured output |
+| Hosting | Vercel (web), Railway (API, no idle sleep), Neon (DB) | No cold start for reviewers |
+| Tests | pytest (engine, ingestion, API, isolation) | |
 
-Store commonly queried fields as typed columns. A raw JSON payload can preserve source provenance and extra columns, but should not replace typed/indexed financial fields. Preserve source row number and original field values alongside normalized values.
+## 4. Authentication and data isolation
 
-### Money and currency
+- **Signup:** email (normalised to lower case, unique) + password (min 8 chars). Password hashed with bcrypt (per-hash salt, adaptive cost).
+- **Login:** constant-time check; the same error for an unknown email and a wrong password, so the response doesn't reveal which emails exist.
+- **Session:** JWT with `sub` = user id, `exp` = 12 h, signed with `JWT_SECRET` from the environment. Sent as an `httpOnly`, `Secure`, `SameSite=Lax` cookie. Logout clears the cookie. There is no refresh token; this trade-off is documented.
+- **Authorisation:** every protected route depends on `current_user`. Every query on user-owned data filters by `user_id` (the user is the tenant). A resource owned by someone else returns **404, not 403**, so its existence isn't leaked.
+- **CSRF:** a SameSite=Lax cookie is not sent on cross-site POSTs. State-changing endpoints also accept only JSON or multipart from the same origin.
+- **Tests** prove that user B cannot list, read, or explain user A's imports or discrepancies.
 
-Parse amounts with Decimal from the original text. Store integer minor units with explicit currency scale or NUMERIC with validated scale. Keep gross amount, discount, net amount, fee, charge amount, refund amount, and settlement amount conceptually distinct. Never aggregate across currency codes without an agreed conversion source, timestamp, and policy.
+## 5. Data model
 
-## 6. CSV ingestion lifecycle
-
-1. Create an upload record in UPLOADED state.
-2. Persist the original file in private object storage.
-3. Validate size, encoding, delimiter, headers, and required columns.
-4. Parse using explicit date and decimal rules.
-5. Record row-level errors and warnings with source row numbers.
-6. Normalize comparison fields while preserving raw values.
-7. Persist valid rows in a transaction or bounded batches.
-8. Mark the upload READY, READY_WITH_WARNINGS, or FAILED.
-9. Allow reconciliation only for uploads in an eligible state.
-
-File-level errors include unreadable/empty files, unsupported encoding, missing required headers, or excessive size. Row-level errors include missing identifiers, invalid dates, malformed amounts, unsupported currencies, and invalid statuses. Warnings can include optional missing fields, duplicate identifiers, and unknown non-critical columns.
-
-Never silently convert malformed financial values to zero or discard invalid rows without a visible validation report. Avoid logging sensitive raw row data.
-
-### Normalization
-
-- Trim leading/trailing whitespace.
-- Apply case normalization only where identifier semantics permit it.
-- Preserve the original identifier exactly.
-- Do not remove punctuation or rewrite identifiers without an explicit rule.
-- Parse timestamps with explicit formats and a documented timezone policy.
-- Keep raw and normalized values side by side.
-
-Use a content hash to detect identical uploads within a tenant and dataset type. Warn rather than silently discard: a customer may intentionally want a new run. Make ingestion idempotent for a given upload ID and parser version.
-
-## 7. Reconciliation design
-
-A reconciliation run is immutable after completion. It references the tenant, selected orders and payments uploads, rules version/configuration, engine version, initiating user, timestamps, status, and summary counters. A rerun creates a new run rather than overwriting previous results.
-
-### Matching approach
-
-Use staged deterministic matching and store evidence for each decision:
-
-1. Normalize identifiers using a documented function.
-2. Group payment events by normalized order reference.
-3. Separate charge and refund events.
-4. Interpret payment status before calculating settlement outcomes.
-5. Compare values only within the same currency.
-6. Account for multiple payment events, partial charges, retries, and refunds using an agreed aggregation policy.
-7. Classify missing, duplicate, ambiguous, and amount-mismatch cases instead of forcing a match.
-
-Do not assume one payment row must equal one order row. The exact matching precedence and accounting semantics remain open until confirmed against the business requirements.
-
-### Candidate classifications
-
-- Matched.
-- Order without payment event.
-- Payment event without order.
-- Amount mismatch.
-- Currency mismatch.
-- Pending payment.
-- Failed payment.
-- Duplicate/repeated payment event.
-- Full or partial refund.
-- Ambiguous match requiring review.
-- Invalid or excluded source row.
-
-A single order may relate to multiple payment events. The result model must support one reconciliation item linked to multiple source events, or a separate evidence/link table.
-
-### Evidence
-
-Persist the source order and payment IDs considered, normalized keys, amounts and currencies compared, included/excluded statuses, applied rule IDs, difference amount, final classification, and reason codes. The UI should allow a reviewer to reach the same conclusion without relying on AI-generated prose.
-
-### Concurrency
-
-Prevent duplicate active runs for the same input pair using a database constraint, lock, or idempotency key. If processing exceeds request limits, use a background worker/queue. The job must carry run/upload IDs and tenant context, and the worker must re-check ownership.
-
-## 8. Dashboard and investigation experience
-
-Suggested overview metrics: orders imported, payment events imported, matched items, unmatched orders, unmatched payment events, amount discrepancies, pending/failed events, and refund counts/totals. All monetary aggregates must be grouped by currency and clearly define which statuses are included.
-
-Provide a searchable, filterable discrepancy table; filters for run, category, currency, payment status, and date; server-side pagination/sorting; and a detail panel showing source records, related payment events, normalized values, calculations, and reason codes. Include links to the source upload and row number.
-
-Design explicit states for no uploads, invalid files, processing, partial validation, failed processing, and completed runs with no discrepancies. A zero-discrepancy result must be distinguishable from a run with no eligible records.
-
-## 9. Proposed API surface
-
-| Method | Endpoint | Purpose |
+| Table | Purpose | Key columns |
 |---|---|---|
-| GET | /api/v1/me | Current user and tenant context |
-| GET | /api/v1/tenants | List accessible tenants |
-| POST | /api/v1/tenants/{tenant_id}/uploads | Create upload metadata/session |
-| GET | /api/v1/uploads | List current-tenant uploads |
-| GET | /api/v1/uploads/{upload_id} | Upload status and validation summary |
-| POST | /api/v1/uploads/{upload_id}/process | Start/retry ingestion |
-| POST | /api/v1/reconciliation-runs | Create a run for selected uploads |
-| GET | /api/v1/reconciliation-runs | List runs |
-| GET | /api/v1/reconciliation-runs/{run_id} | Run status and summary |
-| GET | /api/v1/reconciliation-runs/{run_id}/items | Paginated results |
-| GET | /api/v1/reconciliation-runs/{run_id}/items/{item_id} | Detailed evidence |
-| POST | /api/v1/reconciliation-runs/{run_id}/items/{item_id}/explanation | Optional AI explanation |
+| `users` | Accounts | id (uuid), email (unique), password_hash, created_at |
+| `imports` | One upload of an orders file + payments file and its reconciliation | id, user_id, orders_filename, payments_filename, orders_sha256, payments_sha256, orders_raw, payments_raw, rules_version, summary (jsonb), created_at. **Unique (user_id, orders_sha256, payments_sha256, rules_version)** |
+| `orders` | Parsed order rows | id, import_id, user_id, row_number, order_id_raw, order_key, order_date, customer_email, currency, gross_amount, discount, net_amount, status, raw (jsonb), dq_flags (text[]) |
+| `payments` | Parsed payment events | id, import_id, user_id, row_number, transaction_ref, order_reference_raw, order_key, processed_at, currency, amount, fee, net_settled, type, status, raw (jsonb), dq_flags |
+| `discrepancies` | One reconciliation result per order key (or per orphan payment) | id, import_id, user_id, order_key, category, severity, currency, expected_amount, actual_amount, difference, amount_at_risk, risk_direction, reason, evidence (jsonb: order rows, payment rows, rule ids) |
+| `explanations` | LLM output cache | id, discrepancy_id (or import_id for run summaries), prompt_version, model, output (jsonb), created_at |
 
-A tenant ID in a URL is a selector, not proof of authorization. The API must verify membership. An active-tenant context/header may be a cleaner contract; this is an open API design choice.
+- Money columns are `NUMERIC(14,2)`, parsed with `Decimal` from the original text.
+- The original CSV text and its sha256 are stored on the import, so raw values stay available for audit. Files go in Postgres rather than object storage on purpose. File + rows + results are written in **one transaction**, so an import is either fully saved or not saved at all. With a separate object store, a failure between the two writes leaves orphaned files or rows pointing at missing files. Object storage is the scale path (section 10).
 
-## 10. AI explanation boundary
+## 5a. Idempotency and failure handling
 
-AI is optional and sits outside the critical reconciliation path. Give the model a compact, typed evidence object containing only facts needed to explain one result. Require it to explain only supplied evidence, disclose incomplete/ambiguous evidence, and never invent transactions, statuses, amounts, causes, or financial actions.
+A repeated request must never repeat its side effects. A failure must never leave half-written state.
 
-The product must remain functional if the provider is unavailable, rate-limited, or returns invalid output. Validate the response schema and use a safe fallback. Avoid sending unnecessary customer-identifying information to the provider.
+| Operation | Duplicate / retry behaviour | How it is enforced |
+|---|---|---|
+| Sign up | Same email twice → second gets `409`, no second account | Unique index on lower-cased email; the insert catches `IntegrityError` (no check-then-insert race) |
+| Upload + reconcile | Same orders + payments file pair (same bytes) → returns the **existing** import with `already_imported: true`; no new rows, no new run | Unique `(user_id, orders_sha256, payments_sha256, rules_version)`. The insert uses `ON CONFLICT DO NOTHING`, then reads back, so two concurrent identical uploads still produce exactly one import |
+| Reconciliation | Re-running on the same import gives byte-identical results | Pure deterministic engine; results are written once, inside the import transaction |
+| Partial failure during import | Parse error, DB error, or crash mid-import → nothing persists | Single transaction around file + orders + payments + discrepancies + summary |
+| LLM explain | Repeated or concurrent clicks for the same item → one stored explanation, returned from cache | Unique `(discrepancy_id, prompt_version)`; insert-or-read-existing |
+| LLM failure | Timeout, provider error, or invalid JSON → one retry, then a deterministic fallback | The fallback is returned, not cached as a real LLM answer, so a later click can retry. Reconciliation data is never touched by this path |
+| Frontend double submit | Upload / explain buttons disable while a request is in flight | Client guard; the server-side rules above are the real protection |
 
-## 11. Observability and operational safety
+Failure-handling rules:
+- Validation errors are reported with row numbers. Invalid financial values are never coerced to 0.
+- Every external call (LLM) has a timeout. Its failure degrades only the explanation, never the core result.
+- Errors return a consistent JSON shape `{ "error": { "code", "message" } }` without stack traces or secrets.
 
-- Use structured logs with request ID and run ID; include tenant ID only where safe.
-- Never log access tokens, secrets, or full raw CSV rows.
-- Track upload lifecycle, run transitions, durations, row counts, and error counts.
-- Define object and parsed-data retention/deletion policies.
-- Store secrets in deployment secret management, never source control.
-- Apply request size limits, rate limits, and strict CORS.
-- Configure database backups and test restore procedures.
-- Use health/readiness endpoints that do not reveal sensitive configuration.
+## 6. Ingestion rules
 
-Do not rely on an ephemeral application filesystem for customer uploads. Use private object storage; a persistent volume is an alternative only when deliberately configured and operationally managed.
+**File level:** UTF-8 (BOM tolerated), size ≤ 5 MB, required headers present (case- and whitespace-insensitive). Missing headers reject the file with a clear message; nothing is partially saved.
 
-## 12. Testing strategy
+**Row level:** a row with an unparseable required financial field (id, amount, currency) is **excluded and reported** with its row number. It is never silently converted to 0. Valid rows still import, and the upload shows "imported with warnings".
 
-**Unit tests:** identifier normalization, raw-value preservation, date parsing, Decimal/currency behavior, status interpretation, charge/refund separation, matching precedence, classification, and evidence generation.
+| Field | Rule |
+|---|---|
+| Order id / order reference | Raw value kept. Match key = `strip().upper()`. Normalisation is recorded as a data-quality note (`ord-1802`, `" ord-1801 "`) |
+| Order date | ISO `YYYY-MM-DD HH:MM:SS` |
+| Payment `processed_at` | `DD/MM/YYYY HH:MM`. The column format is fixed because some rows have day > 12, and order-to-charge lags of 1–90 minutes confirm it. Blank → kept as null with a warning; timing checks are skipped for that row |
+| Amounts | `Decimal`, 2 dp, ≥ 0 |
+| Discount | Blank → 0 **only if** gross = net, else a data-quality error |
+| Consistency | `gross − discount = net` (orders) and `amount − fee = net_settled` (payments) are checked; a mismatch is flagged |
+| Currency | 3-letter uppercase code |
+| Status/type | Known values only: orders `completed / cancelled / refunded`; payments type `charge / refund`, status `settled / pending / failed` |
+| Exact duplicate order row | Collapsed to one, flagged `duplicate_row` (ORD-1004) |
+| Same order id with different content | Flagged `id_conflict`; excluded from matching and shown for review |
+| Duplicate transaction_ref | Exact duplicate collapsed and flagged; different content → conflict |
+| Timezone | Both files are timezone-naive and treated as the same zone; the observed lags support this |
 
-**Integration tests:** upload lifecycle, row-level validation, persistence/rollback, reconciliation against fixture datasets, dashboard aggregation by currency, token verification, tenant membership, and object-download authorization.
+## 7. Reconciliation engine
 
-**Security tests:** cross-tenant list/read/update/delete attempts, guessed resource IDs, unauthorized object downloads, repeated processing requests, concurrent run creation, and role escalation attempts.
+### 7.1 Matching
 
-**Invariants:** a result may reference only records from the same tenant and selected uploads; completed run inputs cannot change; identical inputs and rule versions produce identical classifications/calculations; currency totals are never combined; financial calculations never use binary floats.
+1. Build the order index by `order_key` (after de-duplication).
+2. Group payment events by `order_key`.
+3. Per order, from **settled** events in the **order's currency**: `collected = Σ settled charges − Σ settled refunds`.
+4. Expected net cash by order status: `completed` → `net_amount`; `cancelled` → 0; `refunded` → 0 (a charge followed by a full refund).
+5. Payment groups whose key has no order become **orphan payments**.
 
-## 13. Deployment proposal
+A pending or failed event moves no money and does not count towards `collected`. Fees are processor cost: they are validated (2.9% + $0.30 pattern) but are not part of what the customer owes, so the comparison is order `net_amount` against charge `amount`.
 
-- Next.js frontend: Vercel.
-- FastAPI API: Railway.
-- PostgreSQL: Neon.
-- Original CSVs: private object storage.
-- Add a background worker/queue if ingestion or reconciliation exceeds synchronous request limits.
+### 7.2 Tolerances
 
-Validate platform limits, persistent storage behavior, networking, and secret management before production deployment.
+| Rule | Value | Reasoning |
+|---|---|---|
+| Amount tolerance | **$0.05 absolute per order**, same currency only | Observed noise is ≤ $0.02 (rounding); the smallest real error is $18.50. A percentage tolerance would hide large errors on large orders. Items within tolerance are reported as `WITHIN_TOLERANCE`: counted as reconciled but still visible. |
+| Late charge | Charge processed **> 7 days** after the order (or > 1 h before it) | All normal charges land 1–90 min after the order. Card authorisations typically expire after about 7 days, so a capture weeks later suggests a re-charge or wrong linkage. Refunds are exempt. |
 
-## 14. Decisions to confirm before implementation
+Both values live in one versioned rules config (`RULES_VERSION`), which is stored on every import.
 
-1. Is order_id/order_reference the canonical matching key? Is case/whitespace normalization allowed?
-2. How should duplicate order IDs be handled: import error, ambiguous result, or another policy?
-3. Can an order have retries, multiple successful charges, partial captures, or split payments?
-4. Are refunds full or partial, and how should they net against the original charge?
-5. Which amount is the comparison basis: order net amount, payment amount, settled charge sum, or net_settled after fees?
-6. Are fees informational or part of the reconciliation target?
-7. Which payment statuses count as final/eligible?
-8. Is multi-currency support separate totals only, or is FX conversion required?
-9. What timezone applies when a source timestamp has no offset?
-10. Should valid rows be imported when other rows are invalid, or should the whole file fail?
-11. Is one reconciliation result per order, per payment event, or a linked group of events?
-12. Can users belong to multiple tenants? Which roles are needed?
-13. What file-size/row-count limits and retention policy apply?
-14. Which exact dashboard metrics and filters are required by the product brief?
+### 7.3 Classification (first matching rule wins)
 
-## 15. Suggested delivery sequence
+| # | Category | Condition | Severity | Amount at risk | Direction |
+|---|---|---|---|---|---|
+| 1 | `CURRENCY_MISMATCH` | Any payment event currency ≠ order currency | High | Order net | Unverified |
+| 2 | `MISSING_PAYMENT` | Completed order, no payment events | High | Order net | Under-collected |
+| 3 | `PAYMENT_FAILED` | No settled charge; a failed charge exists | High | Order net | Under-collected |
+| 4 | `PAYMENT_PENDING` | No settled charge; a pending charge exists | Low | Order net | Under-collected (pending) |
+| 5 | `CANCELLED_BUT_CHARGED` | Cancelled order, collected > 0 | High | Collected | Over-collected |
+| 6 | `REFUND_INCOMPLETE` | Refunded order, collected > 0 | High | Collected | Over-collected |
+| 7 | `REFUND_NOT_RECORDED` | Completed order, settled refund(s) exist | Medium | Refunded amount | Under-collected (revenue overstated) |
+| 8 | `DUPLICATE_CHARGE` | > 1 settled charge, each equal to the expected amount, sum > expected | High | Collected − expected | Over-collected |
+| 9 | `OVERCHARGED` | collected − expected > tolerance | High | Difference | Over-collected |
+| 10 | `UNDERCHARGED` | expected − collected > tolerance | Medium | Difference | Under-collected |
+| 11 | `WITHIN_TOLERANCE` | 0 < \|difference\| ≤ tolerance | Info | 0 | — |
+| 12 | `LATE_CHARGE` | Amount agrees, timing rule breached | Low | 0 | — |
+| 13 | `MATCHED` | Everything agrees | — | 0 | — |
+| — | `ORPHAN_PAYMENT` | Payment whose order key has no order | Medium | Payment amount | Over-collected (unexplained cash) |
 
-1. Agree on requirements, terminology, example outcomes, and edge cases.
-2. Finalize identity/tenant authorization and data contracts.
-3. Implement upload metadata, private storage, CSV validation, and normalized persistence.
-4. Implement deterministic reconciliation with fixture-driven tests.
-5. Add run history, dashboard aggregates, and discrepancy exploration.
-6. Add optional AI explanations over stored evidence.
-7. Add deployment hardening, observability, and tenant-isolation regression tests.
+A cancelled or refunded order with net collected = 0 is correct and is classified `MATCHED`.
 
-Do not treat implementation decisions as locked until the requirements and reconciliation semantics have been reviewed with concrete examples.
+Precedence rationale: a currency mismatch makes every amount comparison meaningless, so it goes first. Missing or unsettled money comes next. Status-driven expectations (cancelled/refunded) are checked before the generic amount comparison, so a cancelled-but-charged order is not mislabelled as "overcharged".
+
+Severity reflects the order of action: **customer harm first** (they were charged wrongly, so there is chargeback and trust risk), then **revenue leakage**, then hygiene. Within a severity level, items sort by amount at risk, descending.
+
+### 7.4 Data-quality notes (not discrepancies)
+
+Normalised references, blank optional fields, collapsed duplicate rows, fee rounding, and missing timestamps are attached to the item as `dq_flags`. They are listed in a separate "Data quality" view. They never inflate the dispute totals.
+
+### 7.5 Determinism
+
+- No randomness, no wall-clock time inside the engine, no LLM.
+- Output is sorted by a stable key (`severity rank, amount_at_risk desc, order_key`).
+- A test shuffles input row order and asserts an identical result. A golden-file test pins the expected category of every order in the sample data.
+
+## 8. Headline metrics (per currency, never summed across currencies)
+
+| Metric | Definition |
+|---|---|
+| Total orders | Unique order keys (raw row count shown alongside) |
+| Total payments | Payment events (charges / refunds) and settled charge value |
+| Value reconciled | Σ order net for `MATCHED`, `WITHIN_TOLERANCE`, `LATE_CHARGE` |
+| Value in dispute | Face value of every record that does not reconcile (order net, or payment amount for orphans) |
+| Money at risk | Σ `amount_at_risk`, split into **under-collected** (store is short), **over-collected** (owed to customers or unexplained cash), and **unverified** (currency mismatch) |
+
+"In dispute" is how much business is affected. "At risk" is how much money is actually wrong. For example, ORD-1401 is $92.81 in dispute but $25.00 at risk.
+
+## 9. LLM explanations
+
+- **Where:** backend endpoints `POST /api/imports/{id}/discrepancies/{did}/explain` and `POST /api/imports/{id}/summary/explain`. The API key lives only in the backend environment.
+- **Input:** a compact evidence object (category, rule, amounts, currencies, statuses, event list, timestamps). **No customer email or other PII is sent.**
+- **Output (JSON schema):** `{ summary, likely_cause, recommended_actions[], confidence: low|medium|high }`; for a run summary, `{ headline, top_issues[], recommended_priorities[] }`.
+- **Parameters:** temperature **0.2**. Explanations should be stable and faithful to the evidence, not creative. It is slightly above 0 so the wording doesn't degenerate. Output tokens are capped and the request has a timeout (20 s).
+- **Bad responses:** a provider error, timeout, non-JSON output, or schema violation leads to one retry. If that also fails, the API returns a **deterministic template explanation** built from the evidence, marked `source: "fallback"`. The UI shows which source produced the text. The reconciliation result never depends on the LLM.
+- **Cache:** results are stored in `explanations`, keyed by item + prompt version, so repeated clicks are free and consistent.
+
+## 10. Deliberate cuts (and how to add them back)
+
+| Cut | Reason | Path forward |
+|---|---|---|
+| Organisations / memberships / roles | The requirement is per-user isolation | Add `tenants` + `memberships`; swap the `user_id` filter for `tenant_id` |
+| Object storage for files | Files are KB-sized and stored in Postgres with a hash | S3 with private keys + signed URLs |
+| Background queue | Synchronous processing finishes in milliseconds | Worker + job table; the job carries ids and re-checks ownership |
+| Refresh tokens / password reset | Out of scope for 24 h | Rotating refresh token, email reset flow |
+| Postgres row-level security | One enforced query layer + tests | RLS as defence in depth |
+| FX conversion | No agreed rate source | Rates table with source and timestamp |
+
+## 11. API
+
+| Method | Path | Purpose |
+|---|---|---|
+| POST | `/api/auth/signup` · `/api/auth/login` · `/api/auth/logout` | Session |
+| GET | `/api/auth/me` | Current user |
+| POST | `/api/imports` | Multipart: `orders` + `payments` files → validate, store, reconcile |
+| GET | `/api/imports` | The user's import history |
+| GET | `/api/imports/{id}` | Summary metrics + validation report |
+| GET | `/api/imports/{id}/discrepancies` | Filter by category / severity / direction / search; paginated |
+| GET | `/api/imports/{id}/discrepancies/{did}` | Full evidence |
+| POST | `/api/imports/{id}/discrepancies/{did}/explain` | LLM explanation |
+| POST | `/api/imports/{id}/summary/explain` | LLM summary of the whole run |
+| GET | `/api/health` | Liveness |
+
+## 12. UI
+
+1. **Login / Sign up.**
+2. **Imports:** upload both files (drag and drop) and see the validation report and import history.
+3. **Dashboard** (latest import by default):
+   - KPI row: orders, payments, reconciled, in dispute, money at risk (under / over / unverified).
+   - Chart: money at risk by category. Clicking a bar filters the table.
+   - **"Look at these first"** table: severity, category, order, expected vs actual, at risk. Filters, search, and sorting are included. Clicking a KPI filters the table.
+   - Row → side drawer with evidence, data-quality notes, and an **Explain with AI** button (loading, error, and fallback states).
+   - Tabs: Discrepancies · Data quality · AI summary.
+   - Explicit states: no imports yet, processing, validation errors, zero discrepancies.
+
+## 13. Testing
+
+- **Engine:** a golden test that pins the expected category for every order in the sample files; the row-shuffle determinism test; unit tests per rule (tolerance edges at 0.05 / 0.06, cancelled with no charge, partial refund).
+- **Ingestion:** date format, blank discount, normalisation, duplicates, missing headers, malformed amounts.
+- **API:** signup/login/logout, duplicate signup → 409, unauthenticated → 401, cross-user access → 404, same file pair uploaded twice → one import, explain called twice → one cached explanation, LLM timeout / malformed JSON → fallback, import failure → no partial rows.
+- The sample CSVs are committed under `backend/tests/fixtures/` as test fixtures.
+
+## 14. Delivery order
+
+1. Engine + ingestion + tests
+2. DB models, migrations, auth, API
+3. Frontend: auth, upload, dashboard, drill-down
+4. LLM explanations + fallback
+5. Deploy (Neon → Railway → Vercel)
+6. README: setup, architecture, reconciliation logic, findings, LLM approach, next steps, AI-tool usage
