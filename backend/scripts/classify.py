@@ -22,7 +22,7 @@ def main() -> None:
     print(f"{'item':<24}{'category':<24}{'cur':<6}{'expected':>11}{'actual':>11}{'at risk':>10}  direction")
     for i in items:
         print(
-            f"{i.item_key:<24}{i.category:<24}{i.currency or '-':<6}{str(i.expected_amount or '-'):>11}"
+            f"{i.item_key:<24}{i.category:<24}{i.currency or '-':<6}{str(i.expected_amount if i.expected_amount is not None else '-'):>11}"
             f"{str(i.actual_amount if i.actual_amount is not None else '-'):>11}{str(i.amount_at_risk):>10}  {i.risk_direction or '-'}"
         )
     print(json.dumps({"orders": o.report(), "payments": p.report()}, indent=2))
