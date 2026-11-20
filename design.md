@@ -281,7 +281,11 @@ Errors use one shape, `{ "error": { "code", "message", "details"? } }`, with no 
   - Per email across all IPs, there is no hard block. After 10 failures in 15 min, each attempt is delayed by 1 s, doubling up to 5 s. The delay happens before the password check and applies to correct attempts too, so a real user is slowed, never locked out.
   - Counters key on the email text whether or not an account exists, so throttling does not reveal accounts.
   - Explain endpoints: 10 per user per minute, to cap LLM cost.
-- **Client IP** comes from `X-Forwarded-For`, counting `TRUSTED_PROXY_HOPS` entries from the right. Entries further left can be forged and are ignored. This value must be verified on the deployed proxy chain.
+- **Client IP:**
+  - If `CLIENT_IP_HEADER` is set and present on the request, its value is used. In production this is `x-vercel-forwarded-for`, which Vercel sets to the browser's IP.
+  - Otherwise it comes from `X-Forwarded-For`, counting `TRUSTED_PROXY_HOPS` entries from the right. Entries further left can be forged and are ignored.
+  - Why the header is needed: verified on the live chain, Railway's edge rewrites `X-Forwarded-For` to `[connecting IP, edge IP]`. Behind Vercel the connecting IP is Vercel's rotating egress address, so the browser's IP only survives in Vercel's own header.
+  - Known limit: a client that calls the API domain directly can set that header itself and evade the per-IP + email limit. The per-email slowdown still applies. A shared secret between the proxies would close this (future work).
 - **Frontend guard:** middleware redirects to `/login` without a session. This is for UX only; the API enforces access.
 
 ## 10. LLM explanations
@@ -391,6 +395,7 @@ Every route except signup, login and health requires a session (`401` otherwise)
 | `COOKIE_SECURE` | API | `true` in production, `false` only for local HTTP |
 | `APP_ORIGINS` | API | Comma-separated origins allowed for `POST` |
 | `TRUSTED_PROXY_HOPS` | API | Number of proxies in front of the API, used to read the client IP; `0` locally |
+| `CLIENT_IP_HEADER` | API | Optional header holding the browser IP, set by the front proxy (`x-vercel-forwarded-for` in production); empty locally |
 | `GEMINI_API_KEY` | API | LLM key |
 | `GEMINI_MODEL` | API | Model id |
 | `API_BASE_URL` | Web (server) | Target of the `/api/*` rewrite |

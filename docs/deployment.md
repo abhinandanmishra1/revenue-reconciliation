@@ -26,7 +26,8 @@ Do the steps in order: each one needs a URL from the one before.
    | `JWT_SECRET` | Output of `python -c "import secrets; print(secrets.token_urlsafe(48))"` |
    | `COOKIE_SECURE` | `true` |
    | `APP_ORIGINS` | Your Vercel URL, e.g. `https://your-app.vercel.app` (no trailing slash; set after step 3, then redeploy) |
-   | `TRUSTED_PROXY_HOPS` | Start with `2`, then verify in step 4 |
+   | `TRUSTED_PROXY_HOPS` | `2` (Railway's edge rewrites `X-Forwarded-For` to `[connecting IP, edge IP]`) |
+   | `CLIENT_IP_HEADER` | `x-vercel-forwarded-for` (Vercel's header with the browser IP; see step 4) |
    | `GEMINI_API_KEY` | Your Gemini API key |
    | `GEMINI_MODEL` | A current model id from the Gemini models page |
 
@@ -44,18 +45,17 @@ Run **one** replica: rate-limit counters are in memory (design.md section 15).
 3. **Environment variable** `API_BASE_URL` = the Railway URL from step 2.4, without a trailing slash. Rewrites are fixed at build time, so **redeploy after changing it**.
 4. Deploy, then copy the production URL into Railway's `APP_ORIGINS` and redeploy the API.
 
-## 4. Verify `TRUSTED_PROXY_HOPS` on the live chain
+## 4. Verify the client IP on the live chain
 
-The API reads the client IP from `X-Forwarded-For`, counting `TRUSTED_PROXY_HOPS` entries from the right. A wrong value either rate-limits everyone together or lets clients forge their IP.
+Per-IP rate limits need the browser's real IP. Verified on this deployment:
+- Railway's edge **replaces** `X-Forwarded-For` with `[connecting IP, edge IP]`, so a forged value never reaches the API.
+- Behind Vercel the connecting IP is Vercel's egress address, which changes between requests. The browser IP only arrives in `x-vercel-forwarded-for`, which Vercel sets itself.
 
-1. Log in once through the Vercel URL.
-2. In Railway **Deployments → Logs**, find `auth request forwarded_for_entries=N`. It records only the hop count, never addresses.
-3. Expected: Vercel sets the browser's IP (replacing anything the browser sent) and Railway's edge appends Vercel's egress IP, so **N = 2 → `TRUSTED_PROXY_HOPS=2`**. The API takes the entry that many places from the right; it does not "skip" that many. With `1` it would read Vercel's rotating egress IP and per-IP limits would never trigger. Observed in production: N = 2 on every request.
-4. Test it from an incognito window: 5 wrong passwords for one email → the 6th attempt returns "Too many attempts". From another network (e.g. a phone hotspot), the correct password still works.
+So set `CLIENT_IP_HEADER=x-vercel-forwarded-for` and `TRUSTED_PROXY_HOPS=2`. The second covers requests that skip Vercel.
 
-If N is 1, Vercel is not forwarding the client IP. The per-IP limits would then group all users behind Vercel's egress IPs. Tell the team before going live.
+Test from an incognito window: 5 wrong passwords for one email, then the 6th attempt says "Too many attempts". From another network (e.g. a phone hotspot) the correct password still works.
 
-Known limit: the Railway domain is public, so a client that bypasses Vercel can put a forged entry where Vercel's would be and evade the per-IP + email limit. The per-email slowdown (counted across all IPs) still applies. Closing this fully needs a shared secret header from Vercel or private networking (future work).
+Known limit: the Railway domain is public, so a client calling it directly can set `x-vercel-forwarded-for` itself and evade the per-IP + email limit. The per-email slowdown (counted across all IPs) still applies. A shared secret between Vercel and the API would close this (future work).
 
 ## 5. Smoke test (fresh incognito window)
 
