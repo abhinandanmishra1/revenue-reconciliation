@@ -47,3 +47,16 @@ def test_email_delay_doubles_and_caps():
         limits.email_failures.hit("a@x.io")
     assert delays[:10] == [0.0] * 10
     assert delays[10:] == [1.0, 2.0, 4.0, 5.0, 5.0]
+
+
+def test_client_ip_header_takes_precedence_when_present():
+    request = req("54.1.1.1, 152.2.2.2")
+    request.headers["x-vercel-forwarded-for"] = "203.0.113.7"
+    assert client_ip(request, 2, "x-vercel-forwarded-for") == "203.0.113.7"
+
+
+def test_client_ip_header_falls_back_to_forwarded_for_when_absent_or_blank():
+    assert client_ip(req("1.1.1.1, 152.2.2.2"), 2, "x-vercel-forwarded-for") == "1.1.1.1"
+    request = req("1.1.1.1, 152.2.2.2")
+    request.headers["x-vercel-forwarded-for"] = "  "
+    assert client_ip(request, 2, "x-vercel-forwarded-for") == "1.1.1.1"

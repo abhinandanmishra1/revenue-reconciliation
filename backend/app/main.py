@@ -42,9 +42,10 @@ def create_app() -> FastAPI:
         names = ("x-forwarded-for", "x-real-ip", "x-vercel-forwarded-for", "x-envoy-external-address", "forwarded")
         return {
             "peer": _mask(request.client.host if request.client else ""),
-            "headers": {n: _mask(request.headers[n]) for n in names if n in request.headers},
-            "client_ip_used": _mask(client_ip(request, settings.trusted_proxy_hops)),
+            "headers": {n: (_mask(request.headers[n]) if n != "forwarded" else "<present>") for n in names if n in request.headers},
+            "client_ip_used": _mask(client_ip(request, settings.trusted_proxy_hops, settings.client_ip_header.strip().lower())),
             "trusted_proxy_hops": settings.trusted_proxy_hops,
+            "client_ip_header": settings.client_ip_header,
         }
 
     return app

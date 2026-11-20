@@ -13,6 +13,8 @@ class Settings(BaseSettings):
     cookie_secure: bool = True
     app_origins: Annotated[list[str], NoDecode] = Field(default_factory=list)
     trusted_proxy_hops: int = Field(default=0, ge=0)
+    # Optional header set by the front proxy with the browser's IP (e.g. x-vercel-forwarded-for).
+    client_ip_header: str = ""
     gemini_api_key: str = ""
     gemini_model: str = ""
 
