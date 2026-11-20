@@ -2,7 +2,7 @@
 
 Upload an orders export and a payment-processor export, and see on one dashboard how much revenue reconciles, how much is in dispute, how much money is at risk, and which orders to look at first. Every result carries its evidence, down to the source row numbers. An LLM can explain a result in plain language, but it never decides one.
 
-- **Live app:** _add the Vercel URL after deployment_
+- **Live app:** https://revenue-reconciliation-p.vercel.app (API: https://revenue-reconciliation-p.up.railway.app/api/health)
 - **Demo login:** _add the demo account after creating it on the live site_
 - **Design:** [`design.md`](design.md) is the source of truth for the data model, rules, metrics, security and API.
 - **Deployment:** [`docs/deployment.md`](docs/deployment.md)
