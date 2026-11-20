@@ -50,10 +50,12 @@ The API reads the client IP from `X-Forwarded-For`, counting `TRUSTED_PROXY_HOPS
 
 1. Log in once through the Vercel URL.
 2. In Railway **Deployments → Logs**, find `auth request forwarded_for_entries=N`. It records only the hop count, never addresses.
-3. Expected: Vercel adds the browser's IP and Railway's edge appends Vercel's egress IP, so **N = 2 → `TRUSTED_PROXY_HOPS=2`**. Set `TRUSTED_PROXY_HOPS` to the N you see, as long as the first entry is the client.
+3. Expected: Vercel sets the browser's IP (replacing anything the browser sent) and Railway's edge appends Vercel's egress IP, so **N = 2 → `TRUSTED_PROXY_HOPS=2`**. The API takes the entry that many places from the right; it does not "skip" that many. With `1` it would read Vercel's rotating egress IP and per-IP limits would never trigger. Observed in production: N = 2 on every request.
 4. Test it from an incognito window: 5 wrong passwords for one email → the 6th attempt returns "Too many attempts". From another network (e.g. a phone hotspot), the correct password still works.
 
 If N is 1, Vercel is not forwarding the client IP. The per-IP limits would then group all users behind Vercel's egress IPs. Tell the team before going live.
+
+Known limit: the Railway domain is public, so a client that bypasses Vercel can put a forged entry where Vercel's would be and evade the per-IP + email limit. The per-email slowdown (counted across all IPs) still applies. Closing this fully needs a shared secret header from Vercel or private networking (future work).
 
 ## 5. Smoke test (fresh incognito window)
 
