@@ -32,8 +32,8 @@ def test_bom_is_tolerated_and_headers_ignore_case_and_spaces() -> None:
     [
         (b"", "empty_file"),
         (b"   \n", "empty_file"),
-        ("order_id;currency\n".encode(), "not_comma_delimited"),
-        ("order_id,net_amount,status\n".encode(), "missing_headers"),
+        (b"order_id;currency\n", "not_comma_delimited"),
+        (b"order_id,net_amount,status\n", "missing_headers"),
         (PAYMENT_HEADER.encode(), "wrong_file"),
         ("\xff\xfeo".encode("latin-1"), "not_utf8"),
         (b"a" * (2 * 1024 * 1024 + 1), "file_too_large"),

@@ -109,8 +109,9 @@ def test_mid_import_failure_leaves_no_rows(user_client, db, monkeypatch):
 
 
 def test_concurrent_duplicate_signup_creates_one_user(client, db):
-    from app.main import app
     from fastapi.testclient import TestClient
+
+    from app.main import app
 
     codes, barrier = [], threading.Barrier(2)
 

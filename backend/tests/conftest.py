@@ -19,9 +19,9 @@ TABLES = "explanations, reconciliation_items, payments, orders, imports, users"
 
 @pytest.fixture(scope="session")
 def db_engine():
-    from alembic import command
     from alembic.config import Config
 
+    from alembic import command
     from app.db.session import get_engine
 
     engine = get_engine()

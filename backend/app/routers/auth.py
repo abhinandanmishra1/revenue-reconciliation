@@ -14,7 +14,12 @@ from app.deps import current_user
 from app.errors import ApiError
 from app.security import tokens
 from app.security.client_ip import client_ip
-from app.security.passwords import MAX_PASSWORD_BYTES, MIN_PASSWORD_BYTES, hash_password, verify_password
+from app.security.passwords import (
+    MAX_PASSWORD_BYTES,
+    MIN_PASSWORD_BYTES,
+    hash_password,
+    verify_password,
+)
 from app.security.ratelimit import limits
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
