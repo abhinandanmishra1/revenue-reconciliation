@@ -23,6 +23,30 @@ def create_app() -> FastAPI:
     def health() -> dict[str, str]:
         return {"status": "ok"}
 
+    # TEMPORARY: shows the caller only its own proxy headers (last IP part masked)
+    # to verify TRUSTED_PROXY_HOPS on the live chain. Remove after verification.
+    from fastapi import Request
+
+    from app.security.client_ip import client_ip
+
+    def _mask(value: str) -> str:
+        out = []
+        for part in value.split(","):
+            ip = part.strip()
+            sep = "." if "." in ip else ":"
+            out.append(sep.join(ip.split(sep)[:-1] + ["x"]) if sep in ip else ip)
+        return ", ".join(out)
+
+    @app.get("/api/debug/forwarded")
+    def debug_forwarded(request: Request) -> dict:
+        names = ("x-forwarded-for", "x-real-ip", "x-vercel-forwarded-for", "x-envoy-external-address", "forwarded")
+        return {
+            "peer": _mask(request.client.host if request.client else ""),
+            "headers": {n: _mask(request.headers[n]) for n in names if n in request.headers},
+            "client_ip_used": _mask(client_ip(request, settings.trusted_proxy_hops)),
+            "trusted_proxy_hops": settings.trusted_proxy_hops,
+        }
+
     return app
 
 
