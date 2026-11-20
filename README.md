@@ -16,7 +16,7 @@ cp .env.example .env        # set JWT_SECRET and POSTGRES_PASSWORD; GEMINI_* are
 docker compose up --build
 ```
 
-Open http://localhost:3000, sign up, and upload the two CSVs (sample files go in `backend/tests/fixtures/`). Without a Gemini key, "Explain with AI" returns the deterministic fallback.
+Open http://localhost:3000, sign up, and upload the orders and payments CSVs. Without a Gemini key, "Explain with AI" returns the deterministic fallback.
 
 ### Without Docker
 
@@ -44,7 +44,9 @@ cd backend
 uv run pytest               # needs Postgres; set TEST_DATABASE_URL to override the default
 ```
 
-The tests cover the engine (golden fixtures, row-shuffle determinism, every rule and refund boundary), ingestion, auth and CSRF, rate limits, idempotent and concurrent uploads, rollback on failure, user isolation, and the LLM adapter against a mocked provider.
+The tests cover the engine (every rule and refund boundary, row-shuffle determinism), ingestion, auth and CSRF, rate limits, idempotent and concurrent uploads, rollback on failure, user isolation, and the LLM adapter against a mocked provider.
+
+The sample exports are not committed. To run the golden tests (every order's category plus the totals in `design.md` section 13), copy them to `backend/tests/fixtures/orders.csv` and `payments.csv`, then run `uv run python scripts/classify.py --write-golden` once. Without the files these tests skip.
 
 ## Architecture
 
@@ -114,24 +116,52 @@ Each type has a fixed severity: customer harm first, then revenue leakage, then 
 
 ## What we found in the sample data
 
-These totals come from the sample exports and are pinned in the golden test (`backend/tests/test_engine_golden.py`):
+The two exports hold 185 order rows (184 unique orders) and 187 payment events. **164 orders match exactly.** Every row parsed: no row was rejected and there were no id conflicts. Totals by currency:
 
 | | USD | EUR |
 |---|---|---|
 | Reconciled | 39,963.28 across 168 orders | — |
 | In dispute | 2,469.37 | 145.00 |
-| Under-collected (store is short) | 886.85 | — |
+| Under-collected (store is short) | 886.85, of which 67.00 is pending | — |
 | Over-collected (owed to customers or unexplained cash) | 936.58 | — |
 | Unverified (currency mismatch) | 210.00 | 145.00 |
 
-What this means for the business:
-- **Most revenue reconciles.** About 94% of USD order value (39,963.28 of 42,432.65) matches what was collected.
-- **About 937 USD may be owed back to customers.** This comes from duplicate charges, overcharges, and cancelled or refunded orders that still hold money. It goes first: it is customer harm and a chargeback risk.
-- **About 887 USD has not been collected,** from missing, failed or pending payments, refunds the order system doesn't show, and undercharges. Part of it is pending and may settle without action.
-- **210.00 USD and 145.00 EUR can't be checked,** because the order and the payment are in different currencies. Someone needs to confirm which currency the customer actually paid in. The app does not do FX conversion, by design.
-- **Data quality:** malformed rows are rejected rather than guessed. When a rejected row can be tied to an order, that order is marked Needs review instead of being reported as a false "missing payment".
+**Problems that need action (19 results)**, in the order the dashboard shows them:
 
-_The per-category breakdown is printed by `cd backend && uv run python scripts/classify.py`; add its highlights here._
+| Type | Orders | At risk | What happened |
+|---|---|---|---|
+| Payment failed | ORD-2001 | 310.00 under | The only charge attempt failed; nothing was collected |
+| Currency mismatch | ORD-1601, ORD-1602 | 210.00 USD, 145.00 EUR unverified | A USD order charged in EUR, and an EUR order charged in USD. The amounts can't be compared without FX |
+| Cancelled but charged | ORD-1701 | 175.00 over | The order was cancelled, but the 175.00 charge was never refunded |
+| Missing payment | ORD-1201, 1202, 1203, 1204 | 392.35 under | Completed orders with no payment event at all |
+| Duplicate charge | ORD-1501, ORD-1502 | 248.58 over | Two identical settled charges each, minutes apart |
+| Refund incomplete | ORD-1702 | 120.00 over | Marked refunded, but only 120.00 of 240.00 was refunded |
+| Overcharged | ORD-1401, ORD-1403 | 85.00 over | Charged 25.00 and 60.00 more than the order total |
+| Orphan payment | ORD-1301, 1302, 1303 | 308.00 over | Settled charges for order ids that don't exist in the orders export |
+| Refund not in orders | ORD-1703 | 99.00 under | Fully refunded in the processor, but the order still says completed for 99.00 |
+| Undercharged | ORD-1402 | 18.50 under | Charged 109.12 for a 127.62 order |
+| Payment pending | ORD-2002 | 67.00 under | The charge is still pending and may settle without action |
+
+**Reconciled, but worth knowing (4):**
+- **Within tolerance:** ORD-1901, ORD-1902 and ORD-1903 differ by 0.01–0.02. This is rounding noise, so the dashboard shows them without raising an alarm.
+- **Late charge:** ORD-2101's charge settled 29 days after the order. Every other charge landed 1–90 minutes after its order.
+
+**Data-quality issues handled without inventing discrepancies:**
+- ORD-1004 appears twice with identical content, so the two rows were merged into one order.
+- Payments for ORD-1801 and ORD-1802 reference `" ord-1801 "` and `"ord-1802"`. After trimming and upper-casing they match normally, and are flagged `reference_normalised`.
+- ORD-2201 has no customer email and a blank discount. Gross equals net, so the discount is treated as 0.
+- ORD-2202's payment has no timestamp, so the timing check is skipped for it.
+- Payment dates are day-first (`13/04/2025`). Some days are greater than 12, so the format is fixed for the whole column rather than guessed per value.
+
+**What it means for the business:**
+- **About 94% of USD order value reconciles** (39,963.28 of 42,432.65). The leakage is concentrated in about 20 orders, not spread across the book.
+- **936.58 USD is owed back to customers or unexplained.** This covers the duplicate charges, overcharges, the cancelled-but-charged order, the half-done refund, and the orphan charges. Fix it first, because it is customer harm and a chargeback risk.
+- **886.85 USD hasn't been collected.** This covers four orders with no payment, one failed payment, the undercharge, and a refund the order system doesn't reflect. 67.00 of it is pending and may resolve itself.
+- **Two orders can't be verified until someone confirms which currency the customer actually paid in.**
+- **Process fixes suggested by the patterns:**
+  - an idempotency key at checkout, to stop duplicate charges;
+  - refunds made through the order system, so that status and amount stay in sync;
+  - validation that payment references exist and are normalised, to prevent orphans and case mismatches.
 
 ## LLM approach
 
