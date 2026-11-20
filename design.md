@@ -162,7 +162,7 @@ Tolerances are code constants versioned by `RULES_VERSION` (not environment vari
 
 | Rule | Value | Why |
 |---|---|---|
-| Amount | 0.05 in the transaction currency, absolute, same currency only | In the sample exports, rounding noise is ≤ 0.02 and the smallest real error is 18.50. A percentage tolerance would hide large errors on large orders. Within-tolerance items stay visible |
+| Amount | 0.05 in the transaction currency, absolute, same currency only | Absorbs cent-level rounding noise while any real pricing error, tens of units, stays above it. A percentage tolerance would hide large errors on large orders. Within-tolerance items stay visible |
 | Timing | A settled charge more than 7 days after the order, or more than 1 h before it | Normal charges land within 1–90 min. Card authorisations typically expire after about 7 days. Refunds are exempt |
 
 ### 6.3 Classification
@@ -282,9 +282,8 @@ Errors use one shape, `{ "error": { "code", "message", "details"? } }`, with no 
   - Counters key on the email text whether or not an account exists, so throttling does not reveal accounts.
   - Explain endpoints: 10 per user per minute, to cap LLM cost.
 - **Client IP:**
-  - If `CLIENT_IP_HEADER` is set and present on the request, its value is used. In production this is `x-vercel-forwarded-for`, which Vercel sets to the browser's IP.
+  - If `CLIENT_IP_HEADER` is set and present on the request, its value is used. Behind Vercel this is `x-vercel-forwarded-for`, which Vercel sets to the browser's IP; the next proxy rewrites `X-Forwarded-For`, so the browser IP survives only there.
   - Otherwise it comes from `X-Forwarded-For`, counting `TRUSTED_PROXY_HOPS` entries from the right. Entries further left can be forged and are ignored.
-  - Why the header is needed: verified on the live chain, Railway's edge rewrites `X-Forwarded-For` to `[connecting IP, edge IP]`. Behind Vercel the connecting IP is Vercel's rotating egress address, so the browser's IP only survives in Vercel's own header.
   - Known limit: a client that calls the API domain directly can set that header itself and evade the per-IP + email limit. The per-email slowdown still applies. A shared secret between the proxies would close this (future work).
 - **Frontend guard:** middleware redirects to `/login` without a session. This is for UX only; the API enforces access.
 
@@ -340,15 +339,8 @@ Every route except signup, login and health requires a session (`401` otherwise)
 
 ## 13. Testing
 
-- **Engine (golden):**
-  - The category of every order in the sample exports is pinned.
-  - Pinned totals:
-    - under-collected 886.85 USD; over-collected 936.58 USD;
-    - unverified 210.00 USD + 145.00 EUR;
-    - reconciled 39,963.28 USD across 168 orders;
-    - in dispute 2,469.37 USD + 145.00 EUR.
-  - The same result is expected after shuffling input rows.
 - **Engine (rules):**
+  - The same result is expected after shuffling input rows.
   - Tolerance edges: 0.05 → within tolerance; 0.06 → mismatch.
   - Correct cases: a split payment, a duplicate charge later refunded, and an overcharge corrected by a refund all reconcile as `MATCHED`.
   - Cancelled orders: with only a failed attempt → `MATCHED`; with a pending charge → pending, over-collected.
@@ -384,7 +376,6 @@ Every route except signup, login and health requires a session (`401` otherwise)
     - unknown and known emails behave the same;
     - a forged forwarded IP is ignored.
   - **Idempotency and failures:** repeat and concurrent uploads → one import; a mid-import failure → no rows; repeat explain → one cached row; a model change → a new explanation; a cross-import explanation is blocked by the FK; LLM timeout or malformed output → fallback.
-- The sample CSVs are not committed. The golden tests read them from `backend/tests/fixtures/` when present and skip otherwise. `scripts/classify.py --write-golden` pins the per-order categories after a human review.
 
 ## 14. Configuration
 

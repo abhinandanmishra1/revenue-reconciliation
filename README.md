@@ -52,8 +52,6 @@ uv run pytest               # needs Postgres; set TEST_DATABASE_URL to override 
 
 The tests cover the engine (every rule and refund boundary, row-shuffle determinism), ingestion, auth and CSRF, rate limits, idempotent and concurrent uploads, rollback on failure, user isolation, and the LLM adapter against a mocked provider.
 
-The sample exports are not committed. To run the golden tests (every order's category plus the totals in `design.md` section 13), copy them to `backend/tests/fixtures/orders.csv` and `payments.csv`, then run `uv run python scripts/classify.py --write-golden` once. Without the files these tests skip.
-
 ## Architecture
 
 ```
@@ -114,7 +112,7 @@ Pending and failed events move no money, so they don't count towards `collected`
 Each type has a fixed severity: customer harm first, then revenue leakage, then hygiene. The table is sorted by severity, then amount at risk, then order key.
 
 **Tolerances, and why:**
-- **0.05, absolute, in the transaction's currency.** Rounding noise in the sample files is ≤ 0.02 and the smallest real error is 18.50. A percentage tolerance would hide large errors on large orders. Items within tolerance stay visible.
+- **0.05, absolute, in the transaction's currency.** It absorbs cent-level rounding noise, while any real pricing error stays well above it. A percentage tolerance would hide large errors on large orders. Items within tolerance stay visible.
 - **Timing.** A settled charge more than 7 days after the order, or more than 1 hour before it, breaks the timing rule. Normal charges land 1–90 minutes after the order, and card authorisations typically expire after about 7 days. Refunds are exempt.
 - **Versioned.** Both values are code constants under `RULES_VERSION`, not environment variables, so a stored import can always be reproduced.
 
