@@ -2,10 +2,16 @@
 
 Upload an orders export and a payment-processor export, and see on one dashboard how much revenue reconciles, how much is in dispute, how much money is at risk, and which orders to look at first. Every result carries its evidence, down to the source row numbers. An LLM can explain a result in plain language, but it never decides one.
 
-- **Live app:** https://revenue-reconciliation-p.vercel.app (API: https://revenue-reconciliation-p.up.railway.app/api/health)
-- **Demo login:** _add the demo account after creating it on the live site_
+- **Live app:** https://revenue-reconciliation-p.vercel.app
+- **API:** https://revenue-reconciliation-p.up.railway.app/api/health
 - **Design:** [`design.md`](design.md) is the source of truth for the data model, rules, metrics, security and API.
-- **Deployment:** [`docs/deployment.md`](docs/deployment.md)
+
+
+## Demo Video
+
+https://github.com/user-attachments/assets/ff98222e-393b-4dd7-9e77-493e4bc99638
+
+
 
 ## Local setup
 
@@ -113,55 +119,6 @@ Each type has a fixed severity: customer harm first, then revenue leakage, then 
 - **Versioned.** Both values are code constants under `RULES_VERSION`, not environment variables, so a stored import can always be reproduced.
 
 **Amounts.** All money is `Decimal` / `NUMERIC(14,2)`. Amounts are never summed across currencies. Each item counts either as reconciled or as in dispute, never both (a database `CHECK` enforces this). Money at risk is split by direction: under-collected, over-collected, or unverified.
-
-## What we found in the sample data
-
-The two exports hold 185 order rows (184 unique orders) and 187 payment events. **164 orders match exactly.** Every row parsed: no row was rejected and there were no id conflicts. Totals by currency:
-
-| | USD | EUR |
-|---|---|---|
-| Reconciled | 39,963.28 across 168 orders | — |
-| In dispute | 2,469.37 | 145.00 |
-| Under-collected (store is short) | 886.85, of which 67.00 is pending | — |
-| Over-collected (owed to customers or unexplained cash) | 936.58 | — |
-| Unverified (currency mismatch) | 210.00 | 145.00 |
-
-**Problems that need action (19 results)**, in the order the dashboard shows them:
-
-| Type | Orders | At risk | What happened |
-|---|---|---|---|
-| Payment failed | ORD-2001 | 310.00 under | The only charge attempt failed; nothing was collected |
-| Currency mismatch | ORD-1601, ORD-1602 | 210.00 USD, 145.00 EUR unverified | A USD order charged in EUR, and an EUR order charged in USD. The amounts can't be compared without FX |
-| Cancelled but charged | ORD-1701 | 175.00 over | The order was cancelled, but the 175.00 charge was never refunded |
-| Missing payment | ORD-1201, 1202, 1203, 1204 | 392.35 under | Completed orders with no payment event at all |
-| Duplicate charge | ORD-1501, ORD-1502 | 248.58 over | Two identical settled charges each, minutes apart |
-| Refund incomplete | ORD-1702 | 120.00 over | Marked refunded, but only 120.00 of 240.00 was refunded |
-| Overcharged | ORD-1401, ORD-1403 | 85.00 over | Charged 25.00 and 60.00 more than the order total |
-| Orphan payment | ORD-1301, 1302, 1303 | 308.00 over | Settled charges for order ids that don't exist in the orders export |
-| Refund not in orders | ORD-1703 | 99.00 under | Fully refunded in the processor, but the order still says completed for 99.00 |
-| Undercharged | ORD-1402 | 18.50 under | Charged 109.12 for a 127.62 order |
-| Payment pending | ORD-2002 | 67.00 under | The charge is still pending and may settle without action |
-
-**Reconciled, but worth knowing (4):**
-- **Within tolerance:** ORD-1901, ORD-1902 and ORD-1903 differ by 0.01–0.02. This is rounding noise, so the dashboard shows them without raising an alarm.
-- **Late charge:** ORD-2101's charge settled 29 days after the order. Every other charge landed 1–90 minutes after its order.
-
-**Data-quality issues handled without inventing discrepancies:**
-- ORD-1004 appears twice with identical content, so the two rows were merged into one order.
-- Payments for ORD-1801 and ORD-1802 reference `" ord-1801 "` and `"ord-1802"`. After trimming and upper-casing they match normally, and are flagged `reference_normalised`.
-- ORD-2201 has no customer email and a blank discount. Gross equals net, so the discount is treated as 0.
-- ORD-2202's payment has no timestamp, so the timing check is skipped for it.
-- Payment dates are day-first (`13/04/2025`). Some days are greater than 12, so the format is fixed for the whole column rather than guessed per value.
-
-**What it means for the business:**
-- **About 94% of USD order value reconciles** (39,963.28 of 42,432.65). The leakage is concentrated in about 20 orders, not spread across the book.
-- **936.58 USD is owed back to customers or unexplained.** This covers the duplicate charges, overcharges, the cancelled-but-charged order, the half-done refund, and the orphan charges. Fix it first, because it is customer harm and a chargeback risk.
-- **886.85 USD hasn't been collected.** This covers four orders with no payment, one failed payment, the undercharge, and a refund the order system doesn't reflect. 67.00 of it is pending and may resolve itself.
-- **Two orders can't be verified until someone confirms which currency the customer actually paid in.**
-- **Process fixes suggested by the patterns:**
-  - an idempotency key at checkout, to stop duplicate charges;
-  - refunds made through the order system, so that status and amount stay in sync;
-  - validation that payment references exist and are normalised, to prevent orphans and case mismatches.
 
 ## LLM approach
 
