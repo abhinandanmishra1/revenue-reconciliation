@@ -384,7 +384,7 @@ Every route except signup, login and health requires a session (`401` otherwise)
     - unknown and known emails behave the same;
     - a forged forwarded IP is ignored.
   - **Idempotency and failures:** repeat and concurrent uploads → one import; a mid-import failure → no rows; repeat explain → one cached row; a model change → a new explanation; a cross-import explanation is blocked by the FK; LLM timeout or malformed output → fallback.
-- The sample CSVs are added under `backend/tests/fixtures/` with the engine tests.
+- The sample CSVs are not committed. The golden tests read them from `backend/tests/fixtures/` when present and skip otherwise. `scripts/classify.py --write-golden` pins the per-order categories after a human review.
 
 ## 14. Configuration
 
